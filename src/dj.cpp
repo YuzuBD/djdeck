@@ -149,7 +149,10 @@ Track* MakeSineTrack(double seconds, double hz, uint32_t rate, float amp) {
 
 void FreeTrack(Track* t) { delete t; }
 
+std::atomic<uint64_t> tracksLoaded{0};
+
 Track* LoadTrack(const std::string& path, uint32_t outRate, std::string* err) {
+    tracksLoaded.fetch_add(1, std::memory_order_relaxed);
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 2, outRate);
     ma_decoder        dec;
     ma_result         r = ma_decoder_init_file(path.c_str(), &cfg, &dec);

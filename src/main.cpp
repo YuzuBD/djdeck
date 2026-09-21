@@ -562,6 +562,7 @@ static void UpdatePreload() {
         const double dur  = cur->seconds();
         const double pos  = double(d.pos.load(std::memory_order_relaxed)) / cur->sampleRate;
         const double rate = std::max(0.1, double(d.rate.load(std::memory_order_relaxed)));
+        if (pos < 0.5) continue;                     // let a fresh track settle before staging the next one
         if ((dur - pos) / rate > kPreloadLead) continue;
 
         if (P.th.joinable()) P.th.join();                    // the previous decode is finished
@@ -2224,16 +2225,20 @@ int main(int argc, char** argv) {
     }
 
     if (gaplessTest) {
-        std::string       err;
-        const std::string q1 = g_exeDir + "\\gp1.wav", q2 = g_exeDir + "\\gp2.wav";
+        std::string err;
+        const std::string q1 = g_exeDir + "\\gp1.wav";
+        const std::string q2 = g_exeDir + "\\gp2.wav";
+        const std::string q3 = g_exeDir + "\\gp3.wav";
         if (!FileExists(q1)) dj::GenerateDemoWav(q1, 6.0, 124.0, 0, g_eng.sampleRate, &err);
         if (!FileExists(q2)) dj::GenerateDemoWav(q2, 6.0, 124.0, 2, g_eng.sampleRate, &err);
-        g_pl[0].items   = {q1, q2};
+        if (!FileExists(q3)) dj::GenerateDemoWav(q3, 6.0, 124.0, 1, g_eng.sampleRate, &err);
+        // Three items: the second handover proves the preload re-arms after a handover.
+        g_pl[0].items   = {q1, q2, q3};
         g_pl[0].current = 0;
         g_pl[0].mode    = PlaySeq;
         g_halted[0].store(false);
         StartLoad(0, q1, true);
-        Say("gapless test: playing gp1, expecting gp2 preloaded and handed over without a decode");
+        Say("gapless test: 3 tracks, expecting gp2 and gp3 to be preloaded and handed over");
     }
 
     if (resumeTest) {
@@ -2316,10 +2321,13 @@ int main(int argc, char** argv) {
     bool   plSawEnd  = false;
     bool   dropAccepted = false, dropRefused = false;
     int    dropResult = -1;
-    int    gapStage = 0, gapResult = -1;
-    bool   gapArmed = false, gapPreloaded = false, gapMissedEnd = false;
-    const dj::Track* gapPrev = nullptr, *gapArmedPtr = nullptr;
+    int    gapStage = 0, gapResult = -1, gapHits = 0;
+    bool   gapArmed = false, gapMissedEnd = false;
+    bool   gapEverArmed = true, gapAllPreloaded = true;
+    double gapWorst = 0.0;
+    const dj::Track* gapPrev = nullptr;
     double gapT0 = 0.0, gapStart = dj::NowSeconds();
+    uint64_t gapLoads0 = 0;
     int    resumeStage = 0, resumeResult = -1;
     double resumePos = -1.0, resumeStart = dj::NowSeconds();
     double jPrev[2] = {-1.0, -1.0}, jWorstBack[2] = {0.0, 0.0}, jMaxFwd[2] = {0.0, 0.0};
@@ -2465,35 +2473,58 @@ int main(int argc, char** argv) {
             jitterResult = ok ? 0 : 1;
             g_quit       = true;
         }
-        // ---- gapless handover: the next item must arrive decoded, without a decode pause
+        // ---- gapless handover: every transition must use a decoded track, twice in a row
         if (gaplessTest && gapResult < 0) {
             dj::Deck&        d0  = g_eng.deck[0];
             const dj::Track* cur = d0.current.load(std::memory_order_acquire);
             if (gapStage == 0 && cur && d0.playing.load()) {
-                gapPrev  = cur;
-                gapStart = dj::NowSeconds();
-                gapStage = 1;
+                gapPrev     = cur;
+                gapArmed    = false;
+                gapStart    = dj::NowSeconds();
+                gapStage    = 1;
             } else if (gapStage == 1) {
-                if (g_staged[0].track) { gapArmed = true; gapArmedPtr = g_staged[0].track; }
-                if (d0.atEnd.load())            { gapT0 = dj::NowSeconds(); gapStage = 2; }
-                else if (cur && cur != gapPrev) { gapT0 = dj::NowSeconds(); gapMissedEnd = true; gapStage = 3; }
+                if (g_staged[0].track) gapArmed = true;   // a decoded item is waiting
+                if (d0.atEnd.load()) {
+                    gapT0      = dj::NowSeconds();
+                    gapLoads0  = dj::tracksLoaded.load();
+                    gapStage   = 2;
+                } else if (cur && cur != gapPrev) {
+                    gapT0 = dj::NowSeconds(); gapLoads0 = dj::tracksLoaded.load();
+                    gapMissedEnd = true; gapStage = 3;
+                }
             } else if (gapStage == 2 && cur && cur != gapPrev) {
-                gapPreloaded = gapArmedPtr && cur == gapArmedPtr;
-                gapStage     = 3;
+                gapStage = 3;                             // the new track is on the deck
+            } else if (gapStage == 3 && cur && cur != gapPrev && d0.playing.load()) {
+                const double gap     = dj::NowSeconds() - gapT0;
+                const uint64_t decodes = dj::tracksLoaded.load() - gapLoads0;
+                ++gapHits;
+                gapEverArmed    &= gapArmed;
+                gapAllPreloaded &= (decodes == 0);      // the proof: no decode was needed
+                gapWorst = std::max(gapWorst, gap);
+                printf("[djdeck] GAPLESS HANDOVER %d: %s | armed=%d | decodes for the handover=%llu | "
+                       "gap=%.3fs | queue now %d/%d\n",
+                       gapHits, (gapArmed && decodes == 0 && gap <= 0.15) ? "OK" : "FAIL",
+                       (int)gapArmed, (unsigned long long)decodes, gap, g_pl[0].current + 1,
+                       (int)g_pl[0].items.size());
+                if (gapHits >= 2) {
+                    const bool ok = gapEverArmed && gapAllPreloaded && gapWorst <= 0.15 &&
+                                    g_pl[0].current == 2;
+                    printf("[djdeck] GAPLESS SUMMARY: %s | handovers=%d | all preloaded=%d | "
+                           "worst gap=%.3fs%s\n",
+                           ok ? "OK" : "FAIL", gapHits, (int)gapAllPreloaded, gapWorst,
+                           gapMissedEnd ? " | (an end latch coalesced into one frame)" : "");
+                    gapResult = ok ? 0 : 1;
+                    g_quit    = true;
+                } else {                                  // re-arm for the next transition
+                    gapPrev     = cur;
+                    gapArmed    = false;
+                    gapStage    = 1;
+                    gapStart    = dj::NowSeconds();
+                }
             }
-            if (gapStage == 3 && cur && cur != gapPrev && d0.playing.load()) {
-                const double gap = dj::NowSeconds() - gapT0;
-                const bool   ok  = gapArmed && gapPreloaded && gap <= 0.15 && g_pl[0].current == 1;
-                printf("[djdeck] GAPLESS HANDOVER: %s | preload armed=%d | handover used the decoded "
-                       "track=%d | gap=%.3fs%s | queue now %d/%d\n",
-                       ok ? "OK" : "FAIL", (int)gapArmed, (int)gapPreloaded, gap,
-                       gapMissedEnd ? " (end latch coalesced into one frame)" : "",
-                       g_pl[0].current + 1, (int)g_pl[0].items.size());
-                gapResult = ok ? 0 : 1;
-                g_quit    = true;
-            } else if (gapResult < 0 && dj::NowSeconds() - gapStart > 30.0) {
-                printf("[djdeck] GAPLESS HANDOVER: FAIL (timeout) | stage=%d armed=%d queue=%d/%d\n",
-                       gapStage, (int)gapArmed, g_pl[0].current + 1, (int)g_pl[0].items.size());
+            if (gapResult < 0 && dj::NowSeconds() - gapStart > 30.0) {
+                printf("[djdeck] GAPLESS SUMMARY: FAIL (timeout) | stage=%d hits=%d queue=%d/%d\n",
+                       gapStage, gapHits, g_pl[0].current + 1, (int)g_pl[0].items.size());
                 gapResult = 1;
                 g_quit    = true;
             }

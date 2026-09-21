@@ -34,7 +34,9 @@ struct Track {
 
 // Blocking decode+analyze. Call from a worker thread, never from the audio thread.
 Track* LoadTrack(const std::string& path, uint32_t outRate, std::string* err);
-// Synthetic test signal (used by --selftest and when no music is at hand).
+// How many decodes have run since startup: lets a test prove that a track handover
+// happened without decoding anything.
+extern std::atomic<uint64_t> tracksLoaded;
 Track* MakeSineTrack(double seconds, double hz, uint32_t rate, float amp);
 void   FreeTrack(Track* t);
 // Renders the peak columns into an RGBA image (baked deck colour) for the GPU texture.
