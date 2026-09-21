@@ -1,0 +1,27 @@
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: bash
+        # build.sh fetches the portable LLVM-MinGW toolchain into tools/ on first run
+        # (~190 MB, one time per job), then compiles incrementally.
+        run: bash build.sh
+
+      - name: Engine self test
+        shell: bash
+        # A runner has no audio endpoint, so the device checks are opted out of with
+        # --allow-no-device: they print [SKIP] instead of failing. Everything else -
+        # mixer law, limiter, declick, EQ, hot swap, queue modes, speed - is headless
+        # and must pass. Non-zero exit means at least one check failed.
+        run: build/djdeck.exe --selftest --allow-no-device

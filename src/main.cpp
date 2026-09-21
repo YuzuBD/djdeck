@@ -167,17 +167,80 @@ static float                   g_fadeSecs = 4.0f;
 static bool                    g_quit = false;
 static std::string             g_exeDir;
 static bool                    g_demoDrag = false;   // screenshot hook: render the drag overlay
+static bool                    g_showMixer  = false;  // secondary panel, opened from the top bar (M)
+static bool                    g_showPanels = true;   // browser + playlists strip (player page furniture)
 
 // ---- playlists (one queue per deck)
+// The deck owns playback; a playlist only decides what to play next when a track
+// ends on a deck nobody paused. Modes are per queue, not global.
+enum PlayMode { PlaySeq = 0, PlayAll, PlayOne, PlayShuffle };
+static constexpr int kPlayModeCount = 4;
+static const char* kPlayModeName[kPlayModeCount]  = {"SEQ", "ALL", "ONE", "SHUF"};
+static const char* kPlayModeTip[kPlayModeCount]   = {
+    "顺序播放:放完自动下一首,到队列末尾停止",
+    "列表循环:放完最后一首回到第一首",
+    "单曲循环:反复播放当前这首",
+    "随机播放:一轮内不重复,且不会连播同一首",
+};
+
 struct Playlist {
     std::vector<std::string> items;
-    int  current  = -1;      // item currently on the deck (-1 = not from the list)
-    int  selected = -1;
-    bool autoNext = true;    // advance when a track ends while the deck is not paused
+    int      current  = -1;          // item currently on the deck (-1 = not from the list)
+    int      selected = -1;
+    PlayMode mode     = PlaySeq;
+    // shuffle bookkeeping: `order` is a permutation of the item indices, consumed
+    // once per cycle, so a pass never repeats a track and never repeats back-to-back
+    std::vector<int> order;
+    int              orderPos = 0;
+    uint32_t         rng      = 0x2545F491u;
 };
 static Playlist            g_pl[2];
-static std::atomic<bool>   g_userPaused[2] = {{true}, {true}};  // paused by the user, not by the track end
+// The deck must not auto-advance: set when the user pauses/loads/ejects the deck and
+// when a queue runs out, cleared whenever playback is (re)started.
+static std::atomic<bool>   g_halted[2] = {{true}, {true}};
 static std::atomic<bool>   g_autoPending[2] = {{false}, {false}};  // start playing once the auto-load lands
+
+// Deterministic LCG: shuffle order must be reproducible for the tests.
+static inline uint32_t RngNext(uint32_t& s) { s = s * 1664525u + 1013904223u; return s >> 9; }
+
+// Rebuild the shuffle order (Fisher-Yates). `avoidFirst` is never placed at the
+// front, which is what stops a cycle from starting with the track that just played.
+static void ShuffleReset(Playlist& pl, int avoidFirst) {
+    pl.order.resize(pl.items.size());
+    for (int k = 0; k < (int)pl.order.size(); ++k) pl.order[k] = k;
+    for (int k = (int)pl.order.size() - 1; k > 0; --k)
+        std::swap(pl.order[k], pl.order[(int)(RngNext(pl.rng) % (uint32_t)(k + 1))]);
+    if (avoidFirst >= 0 && pl.order.size() > 1 && pl.order[0] == avoidFirst)
+        std::swap(pl.order[0], pl.order[1 + (int)(RngNext(pl.rng) % (uint32_t)(pl.order.size() - 1))]);
+    pl.orderPos = 0;
+}
+
+// The next item for the queue's mode, or -1 when playback should stop here.
+// Only the shuffle cursor changes; the caller owns `current`.
+static int PlaylistNext(Playlist& pl) {
+    const int n = (int)pl.items.size();
+    if (n == 0) return -1;
+    switch (pl.mode) {
+        case PlaySeq:     return (pl.current + 1 < n) ? pl.current + 1 : -1;
+        case PlayAll:     return (pl.current + 1) % n;
+        case PlayOne:     return pl.current >= 0 ? pl.current : -1;
+        case PlayShuffle:
+            if ((int)pl.order.size() != n) ShuffleReset(pl, -1);
+            if (pl.orderPos >= (int)pl.order.size()) ShuffleReset(pl, pl.current);
+            return pl.order[pl.orderPos++];
+    }
+    return -1;
+}
+
+// Keep the shuffle cursor in step when the user starts a row by hand.
+static void ShuffleNoteManual(Playlist& pl, int index) {
+    if (pl.mode != PlayShuffle) return;
+    if ((int)pl.order.size() == (int)pl.items.size()) {
+        for (int k = 0; k < (int)pl.order.size(); ++k)
+            if (pl.order[k] == index) { pl.orderPos = k + 1; return; }
+    }
+    ShuffleReset(pl, index);
+}
 
 // ---- file browser
 struct BrowserEntry {
@@ -245,8 +308,10 @@ static bool DirExists(const std::string& p) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
+// Exactly what the built-in decoders read: WAV / FLAC / MP3 / Vorbis.
+// (Opus and M4A/AAC would need a custom decoding backend, so they are not listed.)
 static bool HasAudioExt(const std::string& n) {
-    static const char* kExt[] = {".wav", ".mp3", ".flac", ".ogg", ".aif", ".aiff", ".m4a", ".opus"};
+    static const char* kExt[] = {".wav", ".mp3", ".flac", ".ogg"};
     const size_t d = n.find_last_of('.');
     if (d == std::string::npos) return false;
     std::string e = n.substr(d);
@@ -302,7 +367,7 @@ static bool PickFile(std::string* out) {
     OPENFILENAMEW ofn  = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner   = GetActiveWindow();
-    ofn.lpstrFilter = L"Audio (*.wav;*.mp3;*.flac;*.ogg;*.aiff)\0*.wav;*.mp3;*.flac;*.ogg;*.aif;*.aiff\0"
+    ofn.lpstrFilter = L"Audio (*.wav;*.mp3;*.flac;*.ogg)\0*.wav;*.mp3;*.flac;*.ogg\0"
                       L"All files (*.*)\0*.*\0";
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = 2048;
@@ -336,6 +401,50 @@ static void LoadRecents() {
     fclose(f);
 }
 
+// ------------------------------------------------------------------ session
+// Remembers the queues, their play modes, the browser folder and the mixer state
+// (djdeck_session.txt next to the exe). The audio settings stay untouched: this is
+// about not losing the queue when the window closes.
+static void SaveSession() {
+    FILE* f = fopen((g_exeDir + "\\djdeck_session.txt").c_str(), "w");
+    if (!f) return;
+    fprintf(f, "mode %d %d\n", (int)g_pl[0].mode, (int)g_pl[1].mode);
+    fprintf(f, "mixer %d\n", g_showMixer ? 1 : 0);
+    if (!g_browser.dir.empty()) fprintf(f, "browser %s\n", g_browser.dir.c_str());
+    for (int i = 0; i < 2; ++i)
+        for (const auto& p : g_pl[i].items) fprintf(f, "item %c %s\n", 'A' + i, p.c_str());
+    fclose(f);
+}
+
+static void LoadSession() {
+    FILE* f = fopen((g_exeDir + "\\djdeck_session.txt").c_str(), "r");
+    if (!f) return;
+    char line[1024];
+    int  nA = 0, nB = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+        if (!n) continue;
+        if (strncmp(line, "mode ", 5) == 0) {
+            int a = 0, b = 0;
+            if (sscanf(line + 5, "%d %d", &a, &b) == 2) {
+                g_pl[0].mode = (PlayMode)std::clamp(a, 0, (int)kPlayModeCount - 1);
+                g_pl[1].mode = (PlayMode)std::clamp(b, 0, (int)kPlayModeCount - 1);
+            }
+        } else if (strncmp(line, "mixer ", 6) == 0) {
+            g_showMixer = atoi(line + 6) != 0;
+        } else if (strncmp(line, "browser ", 8) == 0) {
+            if (DirExists(line + 8)) { g_browser.dir = line + 8; g_browser.needScan = true; }
+        } else if (strncmp(line, "item A ", 7) == 0) {
+            if (FileExists(line + 7)) { g_pl[0].items.push_back(line + 7); ++nA; }
+        } else if (strncmp(line, "item B ", 7) == 0) {
+            if (FileExists(line + 7)) { g_pl[1].items.push_back(line + 7); ++nB; }
+        }
+    }
+    fclose(f);
+    if (nA || nB) Say("session restored: %d + %d queued tracks", nA, nB);
+}
+
 // ------------------------------------------------------------------ loading
 static void StartLoad(int deckIdx, const std::string& path, bool autoAdvance = false) {
     Loader& L = g_loader[deckIdx];
@@ -345,16 +454,22 @@ static void StartLoad(int deckIdx, const std::string& path, bool autoAdvance = f
     }
     L.cancel.store(false);
     L.busy.store(true);
+    if (!FileExists(path)) {
+        L.busy.store(false);
+        Say("deck %c: %s not found", 'A' + deckIdx, BaseNameOf(path).c_str());
+        return;
+    }
     L.path = path;
     L.deck = deckIdx;
     AddRecent(path);
     // A manual load always leaves the deck paused; a playlist advance takes over playing.
     g_autoPending[deckIdx].store(autoAdvance);
-    if (!autoAdvance) g_userPaused[deckIdx].store(true);
+    if (!autoAdvance) g_halted[deckIdx].store(true);
     int idx = -1;
     for (int k = 0; k < (int)g_pl[deckIdx].items.size(); ++k)
         if (g_pl[deckIdx].items[k] == path) { idx = k; break; }
     g_pl[deckIdx].current = idx;
+    if (!autoAdvance && idx >= 0) ShuffleNoteManual(g_pl[deckIdx], idx);
     Say("deck %c: loading %s ...", 'A' + deckIdx, BaseNameOf(path).c_str());
 
     L.th = std::thread([deckIdx, path]() {
@@ -363,7 +478,10 @@ static void StartLoad(int deckIdx, const std::string& path, bool autoAdvance = f
         const double t0 = dj::NowSeconds();
         dj::Track* t = dj::LoadTrack(path, g_eng.sampleRate, &err);
         if (!t) {
-            Say("deck %c: FAILED to load %s (%s)", 'A' + deckIdx, BaseNameOf(path).c_str(), err.c_str());
+            // Say why, and name the formats the decoders can actually read.
+            const char* hint = HasAudioExt(path) ? "" : "  - only WAV/FLAC/MP3/OGG are decodable";
+            Say("deck %c: FAILED to load %s (%s)%s", 'A' + deckIdx, BaseNameOf(path).c_str(),
+                err.c_str(), hint);
             my.busy.store(false);
             g_autoPending[deckIdx].store(false);
             return;
@@ -396,6 +514,41 @@ static bool TryDropOnDeck(int deck, const std::string& path) {
 static void CollectRetired() {
     for (int i = 0; i < 2; ++i)
         while (dj::Track* old = g_eng.deck[i].TakeRetired()) dj::FreeTrack(old);
+}
+
+// ------------------------------------------------------------------ transport
+// The player controls live in one place: deck row, keyboard shortcuts and the
+// playlist advance all go through these.
+constexpr float kRateMin = 0.5f, kRateMax = 2.0f;   // tape-style resampling range
+constexpr float kTransportH = 40.0f;                // deck transport row (buttons are 30 high)
+
+static void SetDeckRate(int i, float rate) {
+    rate = std::clamp(rate, kRateMin, kRateMax);
+    g_eng.deck[i].rate.store(rate);
+    Say("deck %c: speed %.2fx", 'A' + i, double(rate));
+}
+
+static void TogglePlay(int i) {
+    dj::Deck& d = g_eng.deck[i];
+    if (!d.current.load(std::memory_order_acquire)) {
+        Say("deck %c: nothing loaded", 'A' + i);
+        return;
+    }
+    if (d.playing.load(std::memory_order_relaxed)) {
+        d.playing.store(false);
+        g_halted[i].store(true);
+    } else {
+        if (d.atEnd.load(std::memory_order_relaxed)) d.RequestSeek(0.0);   // replay from the top
+        d.ArmFade(1.0f, 0, false);
+        d.playing.store(true);
+        g_halted[i].store(false);
+    }
+}
+
+static void CueDeck(int i) {
+    g_eng.deck[i].RequestSeek(0.0);
+    g_eng.deck[i].playing.store(false);
+    g_halted[i].store(true);
 }
 
 // ------------------------------------------------------------------ textures
@@ -505,40 +658,11 @@ static bool HFader(const char* id, float* v, ImVec2 size, const char* l, const c
     dl->AddRectFilled(ImVec2(p.x, cy - h * 0.5f), ImVec2(hx, cy + h * 0.5f), IM_COL32(56, 92, 140, 255), h * 0.5f);
     dl->AddRectFilled(ImVec2(hx - 7.0f, p.y), ImVec2(hx + 7.0f, p.y + size.y),
                       active ? IM_COL32(240, 244, 250, 255) : IM_COL32(206, 212, 224, 255), 3.0f);
-    dl->AddText(ImVec2(p.x, p.y - ImGui::GetTextLineHeight() - 2.0f), IM_COL32(140, 146, 160, 255), l);
+    // endpoint labels go under the track: the line above belongs to the section label
+    dl->AddText(ImVec2(p.x, p.y + size.y + 2.0f), IM_COL32(140, 146, 160, 255), l);
     const ImVec2 ts = ImGui::CalcTextSize(r);
-    dl->AddText(ImVec2(p.x + size.x - ts.x, p.y - ImGui::GetTextLineHeight() - 2.0f),
+    dl->AddText(ImVec2(p.x + size.x - ts.x, p.y + size.y + 2.0f),
                 IM_COL32(140, 146, 160, 255), r);
-    ImGui::PopID();
-    return active;
-}
-
-static bool VFader(const char* id, float* v, float vmin, float vmax, ImVec2 size, const char* label) {
-    ImGui::PushID(id);
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::InvisibleButton("##vf", size);
-    const bool active = ImGui::IsItemActive();
-    const bool hover  = ImGui::IsItemHovered();
-    if (active) {
-        const float t = std::clamp((ImGui::GetIO().MousePos.y - p.y) / size.y, 0.0f, 1.0f);
-        *v = vmax - t * (vmax - vmin);
-    }
-    if (hover && ImGui::GetIO().MouseWheel != 0.0f)
-        *v = std::clamp(*v + ImGui::GetIO().MouseWheel * (vmax - vmin) * 0.02f, vmin, vmax);
-    if (hover || active) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float cx = p.x + size.x * 0.5f;
-    dl->AddRectFilled(ImVec2(cx - 3.0f, p.y), ImVec2(cx + 3.0f, p.y + size.y), IM_COL32(30, 31, 37, 255), 3.0f);
-    const float t = (vmax > vmin) ? (*v - vmin) / (vmax - vmin) : 0.0f;
-    const float hy = p.y + size.y * (1.0f - t);
-    dl->AddRectFilled(ImVec2(p.x + 1.0f, hy - 9.0f), ImVec2(p.x + size.x - 1.0f, hy + 9.0f),
-                      active ? IM_COL32(240, 244, 250, 255) : IM_COL32(206, 212, 224, 255), 3.0f);
-    dl->AddLine(ImVec2(cx - 8.0f, hy), ImVec2(cx + 8.0f, hy), IM_COL32(40, 42, 50, 255), 1.5f);
-    if (label) {
-        const ImVec2 ts = ImGui::CalcTextSize(label);
-        dl->AddText(ImVec2(cx - ts.x * 0.5f, p.y + size.y + 2.0f), IM_COL32(140, 146, 160, 255), label);
-    }
     ImGui::PopID();
     return active;
 }
@@ -772,6 +896,71 @@ static WaveHit DrawWaveform(int i, ImVec2 topLeft, ImVec2 size, bool overview) {
 }
 
 // ------------------------------------------------------------------ deck panel
+// Everything in a deck block except the waveform window: padding, header, the
+// transport row, the gap and the overview strip. The layout above shares this.
+static float DeckChromeH(float hdrH, float waveH, float overviewH) {
+    return 20.0f + hdrH + 8.0f + kTransportH + waveH + 4.0f + overviewH;
+}
+
+// The player controls: play/pause, cue, speed (0.5x - 2.0x), volume, level.
+static void DrawDeckTransport(int i, ImVec2 topLeft, float width) {
+    DeckUI&   u        = g_ui[i];
+    dj::Deck& d        = g_eng.deck[i];
+    const bool playing = d.playing.load(std::memory_order_relaxed);
+    const float btnH   = 30.0f;
+    ImGui::SetCursorScreenPos(topLeft);
+    ImGui::PushID(i + 800);
+
+    ImGui::PushStyleColor(ImGuiCol_Button, playing ? IM_COL32(200, 70, 60, 255) : IM_COL32(52, 110, 70, 255));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                          playing ? IM_COL32(225, 85, 72, 255) : IM_COL32(64, 130, 84, 255));
+    if (ImGui::Button(playing ? "PAUSE" : "PLAY", ImVec2(92, btnH))) TogglePlay(i);
+    ImGui::PopStyleColor(2);
+    ImGui::SameLine(0.0f, 8.0f);
+    if (ImGui::Button("CUE", ImVec2(64, btnH))) CueDeck(i);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("回到开头并暂停");
+
+    // speed: tape-style resampling, so the pitch follows the rate
+    ImGui::SameLine(0.0f, 18.0f);
+    float rate = d.rate.load(std::memory_order_relaxed);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("SPEED");
+    ImGui::SameLine(0.0f, 8.0f);
+    if (ImGui::Button("-##spd", ImVec2(28, btnH))) SetDeckRate(i, rate - 0.05f);
+    ImGui::SameLine(0.0f, 4.0f);
+    char rtxt[24];
+    snprintf(rtxt, sizeof(rtxt), "%.2fx", double(rate));
+    ImGui::Button(rtxt, ImVec2(72, btnH));
+    if (ImGui::IsItemClicked()) SetDeckRate(i, 1.0f);        // the readout doubles as "reset"
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("点击回到 1.00x  ( - / = 调整当前音轨 )");
+    ImGui::SameLine(0.0f, 4.0f);
+    if (ImGui::Button("+##spd", ImVec2(28, btnH))) SetDeckRate(i, rate + 0.05f);
+
+    static const float kPreset[5]  = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+    static const char* kPresetLbl[5] = {"0.75x", "1x", "1.25x", "1.5x", "2x"};
+    for (int k = 0; k < 5; ++k) {
+        ImGui::SameLine(0.0f, 6.0f);
+        const bool on = fabsf(rate - kPreset[k]) < 0.001f;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 110, 165, 255));
+        if (ImGui::Button(kPresetLbl[k], ImVec2(48, btnH))) SetDeckRate(i, kPreset[k]);
+        if (on) ImGui::PopStyleColor();
+    }
+
+    // volume: the same channel fader the mixer window shows as GAIN
+    ImGui::SameLine(0.0f, 18.0f);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("VOL");
+    ImGui::SameLine(0.0f, 8.0f);
+    float db = d.faderDb.load(std::memory_order_relaxed);
+    ImGui::SetNextItemWidth(150.0f);
+    if (ImGui::SliderFloat("##vol", &db, -40.0f, 6.0f, db <= -39.5f ? "-inf dB" : "%+.0f dB"))
+        d.faderDb.store(db);
+
+    ImGui::SameLine(0.0f, 14.0f);
+    LevelMeter("dmeter", u.meter[0], u.meter[1], u.hold[0], u.hold[1], ImVec2(56, btnH - 6.0f));
+    ImGui::PopID();
+}
+
 static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float overviewH) {
     DeckUI&          u = g_ui[i];
     dj::Deck&        d = g_eng.deck[i];
@@ -782,7 +971,7 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
     const float pad  = 10.0f;
     const float hdrH = ImGui::GetFrameHeight();
     ImVec2      a(topLeft.x, topLeft.y);
-    ImVec2      b(topLeft.x + width, topLeft.y + hdrH + waveH + overviewH + pad * 2.0f + 4.0f);
+    ImVec2      b(topLeft.x + width, topLeft.y + DeckChromeH(hdrH, waveH, overviewH));
     PanelBg(dl, a, b, IM_COL32(26, 27, 33, 255), 10.0f);
 
     // -------- header
@@ -829,7 +1018,7 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
         d.ejectReq.store(true);
         u.viewLen   = 0.0;
         u.smoothPos = 0.0;
-        g_userPaused[i].store(true);
+        g_halted[i].store(true);
         g_pl[i].current = -1;
         Say("deck %c: ejected", 'A' + i);
     }
@@ -848,31 +1037,36 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
         ImGui::PopItemWidth();
     }
 
-    // -------- waveform + overview  (position is advanced exactly once per deck per frame)
-    UpdateDeckPosition(i);
-    const ImVec2 wavePos(a.x + pad, a.y + hdrH + pad + (L.busy.load() ? 8.0f : 0.0f));
-    const ImVec2 waveSize(width - pad * 2.0f, waveH);
-    DrawWaveform(i, wavePos, waveSize, false);
-    DrawWaveform(i, ImVec2(wavePos.x, wavePos.y + waveH + 4.0f),
-                 ImVec2(width - pad * 2.0f, overviewH), true);
-
-    // -------- metering ballistics
-    const float  mL  = d.meter[0].load(std::memory_order_relaxed);
-    const float  mR  = d.meter[1].load(std::memory_order_relaxed);
+    // -------- metering ballistics (the transport row shows the result)
+    const float  mLv = d.meter[0].load(std::memory_order_relaxed);
+    const float  mRv = d.meter[1].load(std::memory_order_relaxed);
     const double now = dj::NowSeconds();
     for (int c = 0; c < 2; ++c) {
-        const float v = c == 0 ? mL : mR;
+        const float v = c == 0 ? mLv : mRv;
         u.meter[c] = std::max(v, u.meter[c] * 0.90f);
         if (v >= u.hold[c]) { u.hold[c] = v; u.holdT[c] = now; }
         else if (now - u.holdT[c] > 0.9) u.hold[c] *= 0.92f;
     }
+
+    // -------- transport row: the player controls live on the deck, not in the mixer
+    const float ty = a.y + hdrH + pad + (L.busy.load() ? 8.0f : 0.0f);
+    DrawDeckTransport(i, ImVec2(a.x + pad, ty), width - pad * 2.0f);
+
+    // -------- waveform + overview  (position is advanced exactly once per deck per frame)
+    UpdateDeckPosition(i);
+    const ImVec2 wavePos(a.x + pad, ty + kTransportH);
+    const ImVec2 waveSize(width - pad * 2.0f, waveH);
+    DrawWaveform(i, wavePos, waveSize, false);
+    DrawWaveform(i, ImVec2(wavePos.x, wavePos.y + waveH + 4.0f),
+                 ImVec2(width - pad * 2.0f, overviewH), true);
 }
 
 // ------------------------------------------------------------------ mixer panel
-// Fixed grid per strip (nothing overlaps):
-//   y0+0    transport row (32)      PLAY | CUE | LOOP | auto
-//   y0+42   fade row (28)           FADE IN | FADE OUT
-//   y0+92   knob row                name line + 48 px dial + value line, right column = pitch + meter
+// Secondary window (top-bar button / M), flat grid per strip so nothing overlaps:
+//   tag row      DECK A  <track title>
+//   y0+0   (30)  LOOP 8s | FADE IN n s | FADE OUT n s
+//   y0+42        GAIN + LOW/MID/HIGH knobs (label / 48 px dial / value), LEVEL meter right
+// The player-side controls (play, cue, speed, volume) live on the deck itself.
 static constexpr float kStripW = 384.0f;
 static constexpr float kMixerH = 248.0f;
 
@@ -892,41 +1086,26 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
     auto place = [](float x, float y) { ImGui::SetCursorScreenPos(ImVec2(x, y)); };
 
     for (int i = 0; i < 2; ++i) {
-        dj::Deck&        d       = g_eng.deck[i];
-        const dj::Track* t       = d.current.load(std::memory_order_acquire);
-        const bool       playing = d.playing.load(std::memory_order_relaxed);
-        const float      x0      = (i == 0) ? a.x + pad : b.x - pad - stripW;
-        const float      y0      = a.y + pad;
+        dj::Deck&        d  = g_eng.deck[i];
+        const dj::Track* t  = d.current.load(std::memory_order_acquire);
+        const float      x0 = (i == 0) ? a.x + pad : b.x - pad - stripW;
+        const float      y0 = a.y + pad + 22.0f;
         ImGui::PushID(i + 900);
 
-        // ---- row 0: transport
+        // ---- strip tag: which deck, which track
+        place(x0, a.y + pad);
+        ImGui::PushStyleColor(ImGuiCol_Text, i == 0 ? IM_COL32(150, 200, 255, 255) : IM_COL32(255, 180, 130, 255));
+        ImGui::TextUnformatted(i == 0 ? "DECK A" : "DECK B");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0.0f, 10.0f);
+        ImGui::TextDisabled("%.30s", t ? t->title.c_str() : "(empty)");
+
+        // ---- row 0: the DJ-only transport bits (play/cue/speed/volume live on the deck)
         place(x0, y0);
-        ImGui::PushStyleColor(ImGuiCol_Button, playing ? IM_COL32(200, 70, 60, 255) : IM_COL32(52, 110, 70, 255));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                              playing ? IM_COL32(225, 85, 72, 255) : IM_COL32(64, 130, 84, 255));
-        if (ImGui::Button(playing ? "PAUSE" : "PLAY", ImVec2(96, 32))) {
-            if (!t) {
-                Say("deck %c: nothing loaded", 'A' + i);
-            } else if (!playing) {
-                if (d.atEnd.load()) d.RequestSeek(0.0);
-                d.ArmFade(1.0f, 0, false);
-                d.playing.store(true);
-                g_userPaused[i].store(false);
-            } else {
-                d.playing.store(false);
-                g_userPaused[i].store(true);
-            }
-        }
-        ImGui::PopStyleColor(2);
-        ImGui::SameLine(0.0f, 8.0f);
-        if (ImGui::Button("CUE", ImVec2(72, 32))) {
-            d.RequestSeek(0.0);
-            d.playing.store(false);
-            g_userPaused[i].store(true);
-        }
-        ImGui::SameLine(0.0f, 8.0f);
-        if (ImGui::Button("LOOP", ImVec2(72, 32))) {
-            const bool on = !d.loopOn.load();
+        const bool loopOn = d.loopOn.load();
+        if (loopOn) ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 110, 165, 255));
+        if (ImGui::Button(loopOn ? "LOOP 8s ON" : "LOOP 8s", ImVec2(100, 30))) {
+            const bool on = !loopOn;
             if (on && t) {
                 const uint64_t p   = d.pos.load();
                 const uint64_t len = t->sampleRate * 8;   // 8-second loop (no beatgrid in this demo)
@@ -935,26 +1114,20 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
             }
             d.loopOn.store(on);
         }
-        ImGui::SameLine(0.0f, 12.0f);
-        ImGui::Checkbox("auto", &g_pl[i].autoNext);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("playlist: advance to the next item when this track ends\n"
-                              "(only while the deck is not paused)");
-
-        // ---- row 1: fades
-        const float row1 = y0 + 42.0f;
-        place(x0, row1);
+        if (loopOn) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("从当前位置开始 8 秒循环");
+        ImGui::SameLine(0.0f, 8.0f);
         char fl[24], fr[24];
         snprintf(fl, sizeof(fl), "FADE IN %.0fs", g_fadeSecs);
         snprintf(fr, sizeof(fr), "FADE OUT %.0fs", g_fadeSecs);
-        if (ImGui::Button(fl, ImVec2(150, 28)))
+        if (ImGui::Button(fl, ImVec2(130, 30)))
             d.ArmFade(1.0f, (uint32_t)(g_fadeSecs * g_eng.sampleRate), false);
         ImGui::SameLine(0.0f, 8.0f);
-        if (ImGui::Button(fr, ImVec2(150, 28)))
+        if (ImGui::Button(fr, ImVec2(130, 30)))
             d.ArmFade(0.0f, (uint32_t)(g_fadeSecs * g_eng.sampleRate), true);
 
-        // ---- row 2: gain + 3-band EQ, then pitch fader and meter in their own column
-        const float row2 = y0 + 92.0f;
+        // ---- row 1: channel trim + 3-band EQ, level meter on the right
+        const float row2 = y0 + 42.0f;
         place(x0, row2);
         {
             float gain = d.faderDb.load();
@@ -974,24 +1147,11 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
             if (Knob(id, eqLabels[k], txt, &v, -24.0f, 6.0f, knobSz, IM_COL32(180, 220, 255, 255)))
                 d.eqDb[k].store(v <= -23.9f ? -96.0f : v);
         }
-        const float colX    = x0 + stripW - 118.0f;
-        const float dialTop = row2 + lineH;
-        place(colX, row2);
-        ImGui::TextDisabled("PITCH");
-        place(colX + 62.0f, row2);
+        place(x0 + stripW - 62.0f, row2);
         ImGui::TextDisabled("LEVEL");
-        place(colX, dialTop);
-        {
-            float rate = d.rate.load();
-            char  lbl[24];
-            snprintf(lbl, sizeof(lbl), "%+.1f%%", (rate - 1.0f) * 100.0f);
-            if (VFader("pitch", &rate, 0.92f, 1.08f, ImVec2(30, 92), lbl)) d.rate.store(rate);
-            ImGui::SameLine(0.0f, 12.0f);
-            ImGui::BeginGroup();
-            LevelMeter("meter", g_ui[i].meter[0], g_ui[i].meter[1],
-                       g_ui[i].hold[0], g_ui[i].hold[1], ImVec2(46, 92));
-            ImGui::EndGroup();
-        }
+        place(x0 + stripW - 62.0f, row2 + lineH);
+        LevelMeter("meter", g_ui[i].meter[0], g_ui[i].meter[1],
+                   g_ui[i].hold[0], g_ui[i].hold[1], ImVec2(46, 92));
         ImGui::PopID();
     }
 
@@ -1013,17 +1173,17 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
                 if (dt.atEnd.load() || dt.pos.load() + 1000 >= tt->frames) dt.RequestSeek(0.0);
                 dt.ArmFade(1.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), false);
                 dt.playing.store(true);
-                g_userPaused[to].store(false);
+                g_halted[to].store(false);
                 g_eng.deck[from].ArmFade(0.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), true);
                 Say("auto-mix: %c -> %c over %.1fs", 'A' + from, 'A' + to, g_fadeSecs * 1.5f);
             }
         }
-        y += 24.0f;
+        y += 22.0f;
         place(cx, y);
         float xf = g_eng.xfader.load();
-        if (HFader("xf", &xf, ImVec2(240, 42), "A", "B")) g_eng.xfader.store(xf);
+        if (HFader("xf", &xf, ImVec2(240, 34), "A", "B")) g_eng.xfader.store(xf);
 
-        y += 56.0f;
+        y += 34.0f + 26.0f;                          // track + the A/B label line under it
         place(cx, y);
         float fadeSec = g_fadeSecs;
         ImGui::PushItemWidth(150.0f);
@@ -1044,6 +1204,28 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         ImGui::EndGroup();
         ImGui::PopID();
     }
+}
+
+// ------------------------------------------------------------------ mixer window
+// The mixer is a secondary panel now: closed by default, opened from the top bar
+// (or M), floating above the player page. Its own window keeps the main page clean
+// and leaves the full height to the waveforms.
+static constexpr float kMixerW = kStripW * 2.0f + 348.0f;   // two strips + the centre column
+
+static void DrawMixerWindow() {
+    if (!g_showMixer) return;
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(kMixerW, kMixerH + 46.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(std::max(0.0f, io.DisplaySize.x - kMixerW - 40.0f),
+                                   std::max(0.0f, io.DisplaySize.y - kMixerH - 150.0f)),
+                            ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("MIXER  混音台", &g_showMixer,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+        const ImVec2 o = ImGui::GetCursorScreenPos();
+        DrawMixer(o, kMixerW, kMixerH);
+        ImGui::Dummy(ImVec2(kMixerW, kMixerH));
+    }
+    ImGui::End();
 }
 
 // ------------------------------------------------------------------ file browser
@@ -1135,8 +1317,16 @@ static void DrawPlaylistPanel(int i, ImVec2 topLeft, ImVec2 size) {
     ImGui::PushStyleColor(ImGuiCol_Text, i == 0 ? IM_COL32(150, 200, 255, 255) : IM_COL32(255, 180, 130, 255));
     ImGui::Text("PLAYLIST %c", 'A' + i);
     ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d tracks   (drop files here to queue)", (int)pl.items.size());
+    ImGui::SameLine(0.0f, 12.0f);
+    {   // how this queue continues when a track ends on a deck nobody paused
+        int m = (int)pl.mode;
+        ImGui::SetNextItemWidth(92.0f);
+        if (ImGui::Combo("##mode", &m, kPlayModeName, kPlayModeCount)) pl.mode = (PlayMode)m;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kPlayModeTip[(int)pl.mode]);
+    }
+    ImGui::SameLine(0.0f, 10.0f);
+    ImGui::TextDisabled("%d tracks", (int)pl.items.size());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("把文件拖到这里加入队列;列表内拖动可排序");
 
     const float listTop = a.y + pad + ImGui::GetFrameHeight() + 6.0f;
     const float listH   = std::max(40.0f, b.y - footH - listTop);
@@ -1206,9 +1396,10 @@ static void DrawPlaylistPanel(int i, ImVec2 topLeft, ImVec2 size) {
     ImGui::BeginDisabled(!sel);
     if (ImGui::Button("play")) {
         pl.current = pl.selected;
+        ShuffleNoteManual(pl, pl.selected);
         StartLoad(i, pl.items[pl.selected]);
         g_autoPending[i].store(true);          // loading is async: start it as soon as it lands
-        g_userPaused[i].store(false);
+        g_halted[i].store(false);
     }
     ImGui::SameLine();
     if (ImGui::Button("remove")) {
@@ -1245,7 +1436,7 @@ static void DrawStatusBar(ImVec2 topLeft, float width) {
 }
 
 // ------------------------------------------------------------------ playlist advance
-// "If the deck is not paused, keep going through the playlist."
+// "If the deck is not paused, keep going through the queue - the queue's mode says how."
 static void UpdatePlaylists() {
     for (int i = 0; i < 2; ++i) {
         dj::Deck& d  = g_eng.deck[i];
@@ -1256,18 +1447,27 @@ static void UpdatePlaylists() {
             d.ArmFade(1.0f, 0, false);
             d.RequestSeek(0.0);
             d.playing.store(true);
+            g_halted[i].store(false);
             g_autoPending[i].store(false);
             Say("deck %c: playing playlist %d/%d  %s", 'A' + i, pl.current + 1, (int)pl.items.size(),
                 pl.current >= 0 ? BaseNameOf(pl.items[pl.current]).c_str() : "?");
         }
-        // track ended while the deck was not user-paused -> next item
-        if (d.atEnd.load() && !g_userPaused[i].load() && pl.autoNext && !g_loader[i].busy.load() &&
-            !g_autoPending[i].load() && pl.current + 1 < (int)pl.items.size()) {
-            ++pl.current;
-            pl.selected = pl.current;
-            Say("playlist %c: next -> %d/%d  %s", 'A' + i, pl.current + 1, (int)pl.items.size(),
-                BaseNameOf(pl.items[pl.current]).c_str());
-            StartLoad(i, pl.items[pl.current], true);
+        // track ended while the deck was not user-paused -> the queue decides what is next
+        if (d.atEnd.load() && !g_halted[i].load() && !g_loader[i].busy.load() && !g_autoPending[i].load()) {
+            const int next = PlaylistNext(pl);
+            if (next >= 0) {
+                const bool same = (next == pl.current);
+                pl.current  = next;                    // repeat-one keeps the same item
+                pl.selected = next;
+                Say("playlist %c: %s %d/%d  %s", 'A' + i, same ? "repeat" : "next", next + 1,
+                    (int)pl.items.size(), BaseNameOf(pl.items[next]).c_str());
+                StartLoad(i, pl.items[next], true);
+            } else {
+                // nothing left to play: park the deck (this also stops us re-entering here)
+                g_halted[i].store(true);
+                Say("playlist %c: end of queue (%d/%d, %s)", 'A' + i,
+                    pl.current + 1, (int)pl.items.size(), kPlayModeName[(int)pl.mode]);
+            }
         }
     }
 }
@@ -1283,6 +1483,16 @@ static void DrawUI() {
                  ImGuiWindowFlags_MenuBar | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
     if (ImGui::BeginMenuBar()) {
+        ImGui::TextColored(ImVec4(0.62f, 0.78f, 1.00f, 1.0f), "djdeck");
+        ImGui::SameLine(0.0f, 12.0f);
+        // the top-bar buttons: the player page is the default view
+        if (ImGui::Button(g_showMixer ? "MIXER  ON" : "MIXER")) g_showMixer = !g_showMixer;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("打开/关闭混音台窗口 (M)");
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::Button(g_showPanels ? "PANELS  ON" : "PANELS")) g_showPanels = !g_showPanels;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("文件浏览器 + 播放列表");
+        ImGui::SameLine(0.0f, 14.0f);
+
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Load into deck A...", "L")) {
                 std::string p;
@@ -1306,10 +1516,21 @@ static void DrawUI() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
-            ImGui::MenuItem("Space play/pause   Q cue   1/2 focus   left/right seek   X xfade", nullptr, false, false);
+            ImGui::MenuItem("Space play/pause   Q cue   M mixer   1/2 focus", nullptr, false, false);
+            ImGui::MenuItem("left/right seek 5 s   - / = speed   L load   X xfade", nullptr, false, false);
             ImGui::MenuItem("drag waveform = seek, right-drag = scrub, wheel = zoom", nullptr, false, false);
+            ImGui::MenuItem("playlist modes: SEQ / ALL / ONE / SHUF", nullptr, false, false);
             ImGui::EndMenu();
         }
+
+        // right-aligned: which deck the keyboard talks to
+        char right[128];
+        snprintf(right, sizeof(right), "focus: DECK %c   |   %s   |   %s", 'A' + g_focus,
+                 g_deviceOk ? g_eng.deviceName.c_str() : "NO AUDIO DEVICE",
+                 g_showMixer ? "mixer open" : "player");
+        const float rw = ImGui::CalcTextSize(right).x;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - rw - 16.0f));
+        ImGui::TextDisabled("%s", right);
         ImGui::EndMenuBar();
     }
 
@@ -1318,61 +1539,51 @@ static void DrawUI() {
 
     const float pad       = 10.0f;
     const float statusH   = ImGui::GetTextLineHeight() + 10.0f;
-    const float mixerH    = kMixerH;
-    const float deckHdr   = ImGui::GetFrameHeight();
+    const float hdrH      = ImGui::GetFrameHeight();
     const float overviewH = 26.0f;
-    const float bottomH   = std::clamp(avail.y * 0.26f, 160.0f, 280.0f);
+    const float bottomH   = g_showPanels ? std::clamp(avail.y * 0.26f, 160.0f, 280.0f) : 0.0f;
+    const float vpads     = pad * (g_showPanels ? 4.0f : 3.0f);
 
-    const float deckBlockH = (avail.y - statusH - mixerH - bottomH - pad * 4.0f) * 0.5f;
-    const float waveH      = std::max(56.0f, deckBlockH - deckHdr - overviewH - 30.0f);
+    const float deckBlockH = (avail.y - statusH - bottomH - vpads) * 0.5f;
+    const float waveH      = std::max(56.0f, deckBlockH - DeckChromeH(hdrH, 0.0f, overviewH));
 
     float y = origin.y;
     DrawDeck(0, ImVec2(origin.x, y), avail.x, waveH, overviewH);
     y += deckBlockH + pad;
     DrawDeck(1, ImVec2(origin.x, y), avail.x, waveH, overviewH);
     y += deckBlockH + pad;
-    DrawMixer(ImVec2(origin.x, y), avail.x, mixerH);
-    y += mixerH + pad;
 
-    const float inner = avail.x - pad * 2.0f;
-    const float bw    = std::max(280.0f, inner * 0.42f);
-    const float pw    = std::max(190.0f, (inner - bw - pad * 2.0f) * 0.5f);
-    DrawBrowserPanel(ImVec2(origin.x, y), ImVec2(bw, bottomH));
-    DrawPlaylistPanel(0, ImVec2(origin.x + bw + pad, y), ImVec2(pw, bottomH));
-    DrawPlaylistPanel(1, ImVec2(origin.x + bw + pw + pad * 2.0f, y), ImVec2(pw, bottomH));
-    y += bottomH + pad * 0.5f;
+    if (g_showPanels) {
+        const float inner = avail.x - pad * 2.0f;
+        const float bw    = std::max(280.0f, inner * 0.42f);
+        const float pw    = std::max(190.0f, (inner - bw - pad * 2.0f) * 0.5f);
+        DrawBrowserPanel(ImVec2(origin.x, y), ImVec2(bw, bottomH));
+        DrawPlaylistPanel(0, ImVec2(origin.x + bw + pad, y), ImVec2(pw, bottomH));
+        DrawPlaylistPanel(1, ImVec2(origin.x + bw + pw + pad * 2.0f, y), ImVec2(pw, bottomH));
+        y += bottomH + pad * 0.5f;
+    }
 
     DrawStatusBar(ImVec2(origin.x, y), avail.x);
 
     ImGui::Dummy(ImVec2(avail.x, y - origin.y + statusH));
     ImGui::End();
+
+    // secondary panel: drawn after the main window so it floats on top of it
+    DrawMixerWindow();
 }
 
 static void HandleShortcuts() {
     ImGuiIO& io = ImGui::GetIO();
     if (io.WantTextInput) return;
-    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-        dj::Deck& d = g_eng.deck[g_focus];
-        if (d.current.load()) {
-            const bool wasPlaying = d.playing.load();
-            if (wasPlaying) {
-                g_userPaused[g_focus].store(true);
-            } else {
-                if (d.atEnd.load()) d.RequestSeek(0.0);
-                d.ArmFade(1.0f, 0, false);
-                g_userPaused[g_focus].store(false);
-            }
-            d.playing.store(!wasPlaying);
-        }
-    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) TogglePlay(g_focus);
     if (ImGui::IsKeyPressed(ImGuiKey_1, false)) g_focus = 0;
     if (ImGui::IsKeyPressed(ImGuiKey_2, false)) g_focus = 1;
-    if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) {
-        dj::Deck& d = g_eng.deck[g_focus];
-        d.RequestSeek(0.0);
-        d.playing.store(false);
-        g_userPaused[g_focus].store(true);
-    }
+    if (ImGui::IsKeyPressed(ImGuiKey_M, false)) g_showMixer = !g_showMixer;
+    if (ImGui::IsKeyPressed(ImGuiKey_Q, false)) CueDeck(g_focus);
+    if (ImGui::IsKeyPressed(ImGuiKey_Minus, false))
+        SetDeckRate(g_focus, g_eng.deck[g_focus].rate.load(std::memory_order_relaxed) - 0.05f);
+    if (ImGui::IsKeyPressed(ImGuiKey_Equal, false))
+        SetDeckRate(g_focus, g_eng.deck[g_focus].rate.load(std::memory_order_relaxed) + 0.05f);
     if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true) || ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) {
         dj::Deck&        d = g_eng.deck[g_focus];
         const dj::Track* t = d.current.load(std::memory_order_acquire);
@@ -1412,8 +1623,8 @@ static double MaxStep(const std::vector<float>& b, size_t ch = 0) {
     return m;
 }
 
-static int RunSelfTest() {
-    int fails = 0, checks = 0;
+static int RunSelfTest(bool allowNoDevice = false) {
+    int fails = 0, checks = 0, skipped = 0;
     auto check = [&](bool ok, const char* what, const char* fmt = nullptr, ...) {
         ++checks;
         char detail[256] = "";
@@ -1568,6 +1779,84 @@ static int RunSelfTest() {
     while (dj::Track* r = e.deck[0].TakeRetired()) dj::FreeTrack(r);
     while (dj::Track* r = e.deck[1].TakeRetired()) dj::FreeTrack(r);
 
+    // ---- queue modes (pure selection logic: no audio, so every boundary is cheap to cover)
+    {
+        auto mk = [](int n, PlayMode m, int cur) {
+            Playlist p;
+            p.mode    = m;
+            p.current = cur;
+            p.rng     = 20260921u;                     // fixed seed: the shuffle order is reproducible
+            for (int k = 0; k < n; ++k) p.items.push_back(std::string("track") + char('0' + k));
+            return p;
+        };
+        {
+            Playlist p = mk(3, PlaySeq, 0);
+            const int a = PlaylistNext(p); p.current = a;
+            const int b = PlaylistNext(p); p.current = b;
+            const int c = PlaylistNext(p);
+            check(a == 1 && b == 2 && c == -1, "SEQ walks to the end and then stops",
+                  "0->%d->%d->%d", a, b, c);
+        }
+        {
+            Playlist p = mk(3, PlayAll, 2);
+            check(PlaylistNext(p) == 0, "ALL wraps around the end", "2->0");
+        }
+        {
+            Playlist p = mk(2, PlayOne, 1);
+            const int a = PlaylistNext(p); p.current = a;
+            const int b = PlaylistNext(p);
+            check(a == 1 && b == 1, "ONE stays on the same item", "1->%d->%d", a, b);
+        }
+        {
+            Playlist p = mk(5, PlayShuffle, -1);
+            int  prev = -1, repeats = 0, visits[5] = {0, 0, 0, 0, 0};
+            bool bad  = false;
+            for (int step = 0; step < 5 * 100; ++step) {
+                const int nx = PlaylistNext(p);
+                if (nx < 0 || nx >= 5) { bad = true; break; }
+                if (nx == prev) ++repeats;
+                ++visits[nx];
+                prev = p.current = nx;
+            }
+            bool even = !bad;
+            for (int k = 0; k < 5; ++k) if (visits[k] != 100) even = false;
+            check(!bad && repeats == 0, "SHUF never plays the same track twice in a row",
+                  "%d immediate repeats in 500 picks", repeats);
+            check(even, "SHUF plays every track once per cycle", "%d %d %d %d %d",
+                  visits[0], visits[1], visits[2], visits[3], visits[4]);
+        }
+        Playlist one  = mk(1, PlaySeq, 0);
+        Playlist none = mk(0, PlayAll, -1);
+        check(PlaylistNext(one) == -1, "a one-item queue stops in SEQ", nullptr);
+        check(PlaylistNext(none) == -1, "an empty queue never advances", nullptr);
+    }
+
+    // ---- playback speed: tape-style resampling, 0.50x - 2.00x
+    {
+        auto consumed = [&](float rate) {
+            dj::Engine en;
+            en.InitOffline(48000);
+            en.masterGain.store(1.0f);
+            en.xfader.store(0.0f);
+            en.deck[0].pending.store(dj::MakeSineTrack(120.0, 440.0, 48000, 0.4f));
+            std::vector<float> b(1024 * 2);
+            en.RenderBlock(b.data(), 1024);            // adopt first: a load leaves the deck paused
+            en.deck[0].rate.store(rate);
+            en.deck[0].ArmFade(1.0f, 0, false);
+            en.deck[0].playing.store(true);
+            for (int i = 0; i < 100; ++i) en.RenderBlock(b.data(), 1024);
+            const double frames = double(en.deck[0].pos.load());
+            if (dj::Track* r = en.deck[0].current.exchange(nullptr)) dj::FreeTrack(r);
+            while (dj::Track* r = en.deck[0].TakeRetired()) dj::FreeTrack(r);
+            return frames;
+        };
+        const double f1 = consumed(1.0f), f2 = consumed(2.0f), fh = consumed(0.5f);
+        check(fabs(f2 / f1 - 2.0) < 0.02, "2.00x consumes audio twice as fast",
+              "%.0f vs %.0f frames", f2, f1);
+        check(fabs(fh / f1 - 0.5) < 0.02, "0.50x consumes audio half as fast",
+              "%.0f vs %.0f frames", fh, f1);
+    }
+
     // ---- real device ------------------------------------------------------
     dj::Engine live;
     std::string err;
@@ -1590,11 +1879,16 @@ static int RunSelfTest() {
               double(live.cpuLoad.load()) * 100.0);
         live.Stop();
         if (dj::Track* r = live.deck[0].current.exchange(nullptr)) dj::FreeTrack(r);
+    } else if (allowNoDevice) {
+        // Headless machines (CI runners) have no audio endpoint: say so instead of
+        // failing. Opt-in only, so a broken device still fails on a real machine.
+        ++skipped;
+        printf("[SKIP] %-46s no audio device (%s)\n", "WASAPI device opens", err.c_str());
     } else {
         check(false, "WASAPI device opens", "%s", err.c_str());
     }
 
-    printf("\n%d checks, %d failed\n", checks, fails);
+    printf("\n%d checks, %d failed, %d skipped\n", checks, fails, skipped);
     return fails;
 }
 
@@ -1640,6 +1934,7 @@ int main(int argc, char** argv) {
     int  shotFrames = 60;
     bool selfTest = false, genDemo = false, autoplay = false, autoswap = false;
     bool playlistTest = false, dropTest = false, jitterTest = false;
+    bool allowNoDevice = false, mixerOpen = false;
     std::string browserDir;
 
     for (int i = 1; i < argc; ++i) {
@@ -1652,13 +1947,19 @@ int main(int argc, char** argv) {
         else if (a == "--autoplay")                    autoplay = true;
         else if (a == "--autoswap")                  { autoplay = true; autoswap = true; }
         else if (a == "--demo-drag")                   g_demoDrag = true;
+        else if (a == "--mixer")                       mixerOpen = true;   // screenshot hook
+        else if (a == "--allow-no-device")             allowNoDevice = true;
         else if (a == "--playlist-test")             { playlistTest = true; autoplay = false; }
         else if (a == "--drop-test")                 { dropTest = true; autoplay = true; }
         else if (a == "--jitter-test")               { jitterTest = true; autoplay = true; }
         else if (a.rfind("--", 0) != 0)                initial.push_back(a);
     }
 
-    if (selfTest) { SetConsoleOutputCP(CP_UTF8); return RunSelfTest(); }
+    // Screenshot and test runs own their own state: they must never load or save the
+    // user's session (they would otherwise queue pt1.wav / demo_c.wav into it).
+    const bool ephemeral = shotPath || autoplay || playlistTest || dropTest || jitterTest || !initial.empty();
+
+    if (selfTest) { SetConsoleOutputCP(CP_UTF8); return RunSelfTest(allowNoDevice); }
 
     if (genDemo) {
         std::string err;
@@ -1683,6 +1984,10 @@ int main(int argc, char** argv) {
         g_browser.dir      = browserDir;
         g_browser.needScan = true;
     }
+    // Restore the queues only for an interactive start: every test mode (and the
+    // screenshot runs) sets its own state and must not inherit one.
+    if (!ephemeral) LoadSession();
+    if (mixerOpen) g_showMixer = true;
 
     std::string dropPath;
     if (dropTest) {
@@ -1700,10 +2005,10 @@ int main(int argc, char** argv) {
         if (!FileExists(p2)) dj::GenerateDemoWav(p2, 6.0, 124.0, 2, g_eng.sampleRate, &err);
         g_pl[0].items    = {p1, p2};
         g_pl[0].current  = 0;
-        g_pl[0].autoNext = true;
-        g_userPaused[0].store(false);
+        g_pl[0].mode     = PlaySeq;
+        g_halted[0].store(false);
         StartLoad(0, p1, true);
-        Say("playlist test: two 6 s tracks, expecting an automatic advance");
+        Say("playlist test: two 6 s tracks, expecting SEQ advance then a ONE repeat");
     }
 
     if (shotPath || autoplay || !initial.empty()) {
@@ -1773,6 +2078,8 @@ int main(int argc, char** argv) {
     bool done  = false;
     double plTestT0 = dj::NowSeconds();
     int    plTestResult = -1;
+    int    plStage   = 0;
+    bool   plSawEnd  = false;
     bool   dropAccepted = false, dropRefused = false;
     int    dropResult = -1;
     double jPrev[2] = {-1.0, -1.0}, jWorstBack[2] = {0.0, 0.0}, jMaxFwd[2] = {0.0, 0.0};
@@ -1836,23 +2143,45 @@ int main(int argc, char** argv) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         if (playlistTest && plTestResult < 0) {
-            if (g_pl[0].current == 1 && g_eng.deck[0].playing.load()) {
-                printf("[djdeck] PLAYLIST AUTO-ADVANCE: OK - advanced to item 2/2 and playing (%s)\n",
-                       BaseNameOf(g_pl[0].items[1]).c_str());
-                plTestResult = 0;
-                g_quit       = true;
-            } else if (dj::NowSeconds() - plTestT0 > 25.0) {
-                printf("[djdeck] PLAYLIST AUTO-ADVANCE: FAIL - current=%d playing=%d atEnd=%d\n",
-                       g_pl[0].current, (int)g_eng.deck[0].playing.load(),
-                       (int)g_eng.deck[0].atEnd.load());
-                plTestResult = 1;
-                g_quit       = true;
+            if (plStage == 0) {
+                // stage 0: SEQ advances 1/2 -> 2/2 and keeps playing
+                if (g_pl[0].current == 1 && g_eng.deck[0].playing.load()) {
+                    printf("[djdeck] PLAYLIST SEQ ADVANCE: OK - advanced to item 2/2 and playing (%s)\n",
+                           BaseNameOf(g_pl[0].items[1]).c_str());
+                    g_pl[0].mode = PlayOne;                 // stage 1: the same item must replay
+                    plStage      = 1;
+                    plSawEnd     = false;
+                    plTestT0     = dj::NowSeconds();
+                    Say("playlist test: mode ONE, the same item must replay by itself");
+                } else if (dj::NowSeconds() - plTestT0 > 25.0) {
+                    printf("[djdeck] PLAYLIST SEQ ADVANCE: FAIL - current=%d playing=%d atEnd=%d\n",
+                           g_pl[0].current, (int)g_eng.deck[0].playing.load(),
+                           (int)g_eng.deck[0].atEnd.load());
+                    plTestResult = 1;
+                    g_quit       = true;
+                }
+            } else {
+                // stage 1: ONE reloads the same item - watch the end latch rise, clear, then play
+                if (g_eng.deck[0].atEnd.load()) plSawEnd = true;
+                if (plSawEnd && g_pl[0].current == 1 && !g_eng.deck[0].atEnd.load() &&
+                    g_eng.deck[0].playing.load()) {
+                    printf("[djdeck] PLAYLIST ONE REPEAT: OK - item 2/2 replayed automatically (%s)\n",
+                           BaseNameOf(g_pl[0].items[1]).c_str());
+                    plTestResult = 0;
+                    g_quit       = true;
+                } else if (dj::NowSeconds() - plTestT0 > 25.0) {
+                    printf("[djdeck] PLAYLIST ONE REPEAT: FAIL - current=%d playing=%d atEnd=%d sawEnd=%d\n",
+                           g_pl[0].current, (int)g_eng.deck[0].playing.load(),
+                           (int)g_eng.deck[0].atEnd.load(), (int)plSawEnd);
+                    plTestResult = 1;
+                    g_quit       = true;
+                }
             }
         }
         if (dropTest && dropResult < 0) {
             if (frame == 90) {                                   // user pauses deck B first
                 g_eng.deck[1].playing.store(false);
-                g_userPaused[1].store(true);
+                g_halted[1].store(true);
             }
             if (frame == 120) {
                 dropAccepted = TryDropOnDeck(1, dropPath);   // deck B is paused -> accepted
@@ -1908,6 +2237,7 @@ int main(int argc, char** argv) {
         g_loader[i].cancel.store(true);
         if (g_loader[i].th.joinable()) g_loader[i].th.join();
     }
+    if (!ephemeral) SaveSession();          // queues, modes, browser folder, mixer state
     g_eng.Stop();
     for (int i = 0; i < 2; ++i) {
         while (dj::Track* r = g_eng.deck[i].TakeRetired()) dj::FreeTrack(r);
