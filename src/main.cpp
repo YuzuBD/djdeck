@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -199,6 +200,13 @@ static Playlist            g_pl[2];
 // when a queue runs out, cleared whenever playback is (re)started.
 static std::atomic<bool>   g_halted[2] = {{true}, {true}};
 static std::atomic<bool>   g_autoPending[2] = {{false}, {false}};  // start playing once the auto-load lands
+// The track the UI is waiting for before it may (re)start a deck. Set right before a
+// loader publishes, so a start can never land on the track that is on its way out.
+static std::atomic<const dj::Track*> g_awaiting[2] = {{nullptr}, {nullptr}};
+// Where to seek once the newly loaded track is really on the deck (-1 = start at 0).
+static std::atomic<double> g_resumeAt[2] = {{-1.0}, {-1.0}};
+// Remembered play positions (path -> seconds), captured while playing, saved on exit.
+static std::map<std::string, double> g_positions;
 
 // Deterministic LCG: shuffle order must be reproducible for the tests.
 static inline uint32_t RngNext(uint32_t& s) { s = s * 1664525u + 1013904223u; return s >> 9; }
@@ -215,9 +223,11 @@ static void ShuffleReset(Playlist& pl, int avoidFirst) {
     pl.orderPos = 0;
 }
 
-// The next item for the queue's mode, or -1 when playback should stop here.
-// Only the shuffle cursor changes; the caller owns `current`.
-static int PlaylistNext(Playlist& pl) {
+// The index that follows `current` in this queue's mode, or -1 when playback stops.
+// `commit` consumes the shuffle cursor: advance with true, peek with false. A peek
+// never rebuilds a stale order and never touches the RNG, so predicting the next item
+// can not change which item that will be.
+static int PlaylistAdvance(Playlist& pl, bool commit) {
     const int n = (int)pl.items.size();
     if (n == 0) return -1;
     switch (pl.mode) {
@@ -225,12 +235,20 @@ static int PlaylistNext(Playlist& pl) {
         case PlayAll:     return (pl.current + 1) % n;
         case PlayOne:     return pl.current >= 0 ? pl.current : -1;
         case PlayShuffle:
-            if ((int)pl.order.size() != n) ShuffleReset(pl, -1);
-            if (pl.orderPos >= (int)pl.order.size()) ShuffleReset(pl, pl.current);
-            return pl.order[pl.orderPos++];
+            if ((int)pl.order.size() != n) {
+                if (!commit) return -1;                  // stale order: only a real advance may rebuild
+                ShuffleReset(pl, -1);
+            }
+            if (pl.orderPos >= (int)pl.order.size()) {
+                if (!commit) return -1;                  // cycle boundary: the rebuild needs committing
+                ShuffleReset(pl, pl.current);
+            }
+            return pl.order[commit ? pl.orderPos++ : pl.orderPos];
     }
     return -1;
 }
+static int PlaylistNext(Playlist& pl) { return PlaylistAdvance(pl, true); }
+static int PlaylistPeek(Playlist& pl) { return PlaylistAdvance(pl, false); }
 
 // Keep the shuffle cursor in step when the user starts a row by hand.
 static void ShuffleNoteManual(Playlist& pl, int index) {
@@ -414,6 +432,11 @@ static void SaveSession() {
     if (!g_browser.dir.empty()) fprintf(f, "browser %s\n", g_browser.dir.c_str());
     for (int i = 0; i < 2; ++i)
         for (const auto& p : g_pl[i].items) fprintf(f, "item %c %s\n", 'A' + i, p.c_str());
+    int written = 0;                                  // most recent plays first would need order; cap instead
+    for (const auto& kv : g_positions) {
+        if (written++ >= 400) break;
+        fprintf(f, "pos %.2f %s\n", kv.second, kv.first.c_str());
+    }
     fclose(f);
 }
 
@@ -442,10 +465,120 @@ static void LoadSession() {
             if (FileExists(line + 7)) { g_pl[0].items.push_back(line + 7); ++nA; }
         } else if (strncmp(line, "item B ", 7) == 0) {
             if (FileExists(line + 7)) { g_pl[1].items.push_back(line + 7); ++nB; }
+        } else if (strncmp(line, "pos ", 4) == 0) {
+            double      secs = 0.0;
+            int         used = 0;
+            if (sscanf(line + 4, "%lf %n", &secs, &used) == 1 && used > 0 && line[4 + used] &&
+                g_positions.size() < 400)
+                g_positions[line + 4 + used] = secs;
         }
     }
     fclose(f);
     if (nA || nB) Say("session restored: %d + %d queued tracks", nA, nB);
+}
+
+// ------------------------------------------------------------------ positions
+// Where each track was left: sampled about once a second while a deck holds a real
+// file, saved with the session and applied on the next deliberate load of that file.
+static double g_captureT = 0.0;
+
+static void CapturePositions(bool force = false) {
+    const double now = dj::NowSeconds();
+    if (!force && now - g_captureT < 1.0) return;
+    g_captureT = now;
+    for (int i = 0; i < 2; ++i) {
+        dj::Deck&        d = g_eng.deck[i];
+        const dj::Track* t = d.current.load(std::memory_order_acquire);
+        if (!t || t->path.empty() || t->path[0] == '<') continue;   // synthetic tracks have no path
+        const double pos = double(d.pos.load(std::memory_order_relaxed)) / t->sampleRate;
+        const double dur = t->seconds();
+        g_positions[t->path] = (pos > dur - 5.0) ? 0.0 : pos;       // played to the end -> start over
+    }
+}
+
+// ------------------------------------------------------------------ preload
+// The item the queue will play next is decoded *before* the current one ends, so the
+// handover costs one audio block instead of a whole decode. The staged track is owned
+// by the UI thread; it only reaches the audio thread when the deck actually ends.
+static constexpr double kPreloadLead = 12.0;   // start staging this many seconds before the end
+
+struct Staged {
+    dj::Track*  track   = nullptr;   // decoded and waiting, UI-owned
+    int         plIndex = -1;        // queue row it was decoded for
+    std::string path;
+};
+static Staged g_staged[2];
+
+struct Preload {
+    std::thread             th;
+    std::atomic<bool>       busy{false};
+    std::atomic<bool>       cancel{false};
+    std::atomic<dj::Track*> result{nullptr};
+    int                     plIndex = -1;
+    std::string             path;
+};
+static Preload g_pre[2];
+
+// Drop the staged track and stop staging: the preload thread is never joined here
+// (that would stall the UI for the length of a decode), it just publishes into a slot
+// that the hand-off will free.
+static void DiscardStaged(int deck) {
+    g_pre[deck].cancel.store(true);
+    if (g_staged[deck].track) {
+        dj::FreeTrack(g_staged[deck].track);
+        g_staged[deck].track = nullptr;
+    }
+    g_staged[deck].plIndex = -1;
+}
+
+// Called once per frame: hand a finished decode over, then arm a new one if the deck
+// is close enough to the end of its track to need it.
+static void UpdatePreload() {
+    for (int i = 0; i < 2; ++i) {
+        Preload&         P = g_pre[i];
+        dj::Deck&        d = g_eng.deck[i];
+        const dj::Track* cur = d.current.load(std::memory_order_acquire);
+
+        if (!P.busy.load()) {
+            if (dj::Track* t = P.result.exchange(nullptr)) {
+                if (P.cancel.load()) {
+                    dj::FreeTrack(t);
+                } else {
+                    if (g_staged[i].track) dj::FreeTrack(g_staged[i].track);
+                    g_staged[i].track   = t;
+                    g_staged[i].plIndex = P.plIndex;
+                    g_staged[i].path    = P.path;
+                    Say("deck %c: preloaded next  %s", 'A' + i, BaseNameOf(P.path).c_str());
+                }
+            }
+        }
+        const bool canStage = cur && d.playing.load(std::memory_order_relaxed) && !g_halted[i].load() &&
+                              !g_loader[i].busy.load() && !P.busy.load() &&
+                              !g_staged[i].track && g_staged[i].plIndex < 0;
+        if (!canStage) continue;
+
+        const int next = PlaylistPeek(g_pl[i]);
+        if (next < 0 || next >= (int)g_pl[i].items.size()) continue;
+        const double dur  = cur->seconds();
+        const double pos  = double(d.pos.load(std::memory_order_relaxed)) / cur->sampleRate;
+        const double rate = std::max(0.1, double(d.rate.load(std::memory_order_relaxed)));
+        if ((dur - pos) / rate > kPreloadLead) continue;
+
+        if (P.th.joinable()) P.th.join();                    // the previous decode is finished
+        if (dj::Track* stale = P.result.exchange(nullptr)) dj::FreeTrack(stale);   // and irrelevant
+        P.cancel.store(false);
+        P.busy.store(true);
+        P.plIndex = next;
+        P.path    = g_pl[i].items[next];
+        P.th = std::thread([i]() {
+            Preload&    my = g_pre[i];
+            std::string err;
+            dj::Track*  t = dj::LoadTrack(my.path, g_eng.sampleRate, &err);
+            if (!t) Say("deck %c: preload of %s failed (%s)", 'A' + i, BaseNameOf(my.path).c_str(), err.c_str());
+            else    my.result.store(t);
+            my.busy.store(false);
+        });
+    }
 }
 
 // ------------------------------------------------------------------ loading
@@ -468,6 +601,16 @@ static void StartLoad(int deckIdx, const std::string& path, bool autoAdvance = f
     // A manual load always leaves the deck paused; a playlist advance takes over playing.
     g_autoPending[deckIdx].store(autoAdvance);
     if (!autoAdvance) g_halted[deckIdx].store(true);
+    DiscardStaged(deckIdx);              // whatever was preloaded is no longer next
+    g_awaiting[deckIdx].store(nullptr);  // only the loader may re-arm this now
+    // Pick up where this file was left - but only for a deliberate load, never for a
+    // queue advance (a queued track plays from the top).
+    double resume = -1.0;
+    if (!autoAdvance) {
+        auto it = g_positions.find(path);
+        if (it != g_positions.end() && it->second > 3.0) resume = it->second;
+    }
+    g_resumeAt[deckIdx].store(resume);
     int idx = -1;
     for (int k = 0; k < (int)g_pl[deckIdx].items.size(); ++k)
         if (g_pl[deckIdx].items[k] == path) { idx = k; break; }
@@ -496,6 +639,7 @@ static void StartLoad(int deckIdx, const std::string& path, bool autoAdvance = f
         const double      secs  = t->seconds();
         const double      mb    = double(t->pcm.size() * 2) / 1e6;
         const std::string title = t->title;
+        g_awaiting[deckIdx].store(t);            // before busy=false: the UI may only start once this is current
         g_eng.deck[deckIdx].pending.store(t, std::memory_order_release);
         Say("deck %c: %s loaded in %.2fs (%.1f MB, %.1f s)", 'A' + deckIdx, title.c_str(),
             dj::NowSeconds() - t0, mb, secs);
@@ -1019,6 +1163,9 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
     ImGui::SameLine();
     if (ImGui::Button("EJECT", ImVec2(70, 0))) {
         d.ejectReq.store(true);
+        DiscardStaged(i);
+        g_awaiting[i].store(nullptr);
+        g_resumeAt[i].store(-1.0);
         u.viewLen   = 0.0;
         u.smoothPos = 0.0;
         g_halted[i].store(true);
@@ -1445,29 +1592,65 @@ static void UpdatePlaylists() {
         dj::Deck& d  = g_eng.deck[i];
         Playlist& pl = g_pl[i];
 
-        // an auto-advanced track starts playing as soon as the loader hands it over
-        if (g_autoPending[i].load() && !g_loader[i].busy.load() && d.current.load() && !d.playing.load()) {
-            d.ArmFade(1.0f, 0, false);
-            d.RequestSeek(0.0);
-            d.playing.store(true);
-            g_halted[i].store(false);
-            g_autoPending[i].store(false);
-            Say("deck %c: playing playlist %d/%d  %s", 'A' + i, pl.current + 1, (int)pl.items.size(),
-                pl.current >= 0 ? BaseNameOf(pl.items[pl.current]).c_str() : "?");
+        // ---- a remembered position is applied only once the new track really is on the
+        //      deck: seeking before the swap would seek the outgoing track
+        const double resume = g_resumeAt[i].load();
+        if (resume >= 0.0 && !g_loader[i].busy.load()) {
+            const dj::Track* want = g_awaiting[i].load();
+            const dj::Track* cur  = d.current.load(std::memory_order_acquire);
+            if (cur && (!want || cur == want)) {
+                const double at = std::min(resume, std::max(0.0, cur->seconds() - 1.0));
+                d.RequestSeek(at);
+                g_ui[i].smoothPos = at;
+                g_resumeAt[i].store(-1.0);
+                Say("deck %c: resuming %s at %.1f s", 'A' + i, BaseNameOf(cur->title).c_str(), at);
+            }
         }
-        // track ended while the deck was not user-paused -> the queue decides what is next
+
+        // ---- an auto-advanced (or hand-started) track begins as soon as it is current:
+        //      waiting for `g_awaiting` is what keeps a stale start off the outgoing track
+        if (g_autoPending[i].load() && !g_loader[i].busy.load()) {
+            const dj::Track* want = g_awaiting[i].load();
+            const dj::Track* cur  = d.current.load(std::memory_order_acquire);
+            if (cur && (!want || cur == want) && !d.playing.load(std::memory_order_relaxed)) {
+                d.ArmFade(1.0f, 0, false);
+                d.playing.store(true);
+                g_halted[i].store(false);
+                g_autoPending[i].store(false);
+                g_awaiting[i].store(nullptr);
+                Say("deck %c: playing playlist %d/%d  %s", 'A' + i, pl.current + 1, (int)pl.items.size(),
+                    pl.current >= 0 ? BaseNameOf(pl.items[pl.current]).c_str() : "?");
+            }
+        }
+
+        // ---- track ended while the deck was not user-paused -> the queue decides what is next
         if (d.atEnd.load() && !g_halted[i].load() && !g_loader[i].busy.load() && !g_autoPending[i].load()) {
             const int next = PlaylistNext(pl);
             if (next >= 0) {
                 const bool same = (next == pl.current);
                 pl.current  = next;                    // repeat-one keeps the same item
                 pl.selected = next;
-                Say("playlist %c: %s %d/%d  %s", 'A' + i, same ? "repeat" : "next", next + 1,
-                    (int)pl.items.size(), BaseNameOf(pl.items[next]).c_str());
-                StartLoad(i, pl.items[next], true);
+                if (g_staged[i].track && g_staged[i].plIndex == next) {
+                    // already decoded: hand it over and the gap is one audio block
+                    dj::Track* t = g_staged[i].track;
+                    g_staged[i].track   = nullptr;
+                    g_staged[i].plIndex = -1;
+                    g_resumeAt[i].store(-1.0);         // a queue item plays from the top
+                    g_awaiting[i].store(t);
+                    d.pending.store(t, std::memory_order_release);
+                    g_autoPending[i].store(true);
+                    Say("playlist %c: %s %d/%d  %s (preloaded, no gap)", 'A' + i, same ? "repeat" : "next",
+                        next + 1, (int)pl.items.size(), BaseNameOf(pl.items[next]).c_str());
+                } else {
+                    DiscardStaged(i);
+                    Say("playlist %c: %s %d/%d  %s", 'A' + i, same ? "repeat" : "next", next + 1,
+                        (int)pl.items.size(), BaseNameOf(pl.items[next]).c_str());
+                    StartLoad(i, pl.items[next], true);
+                }
             } else {
                 // nothing left to play: park the deck (this also stops us re-entering here)
                 g_halted[i].store(true);
+                DiscardStaged(i);
                 Say("playlist %c: end of queue (%d/%d, %s)", 'A' + i,
                     pl.current + 1, (int)pl.items.size(), kPlayModeName[(int)pl.mode]);
             }
@@ -1832,6 +2015,25 @@ static int RunSelfTest(bool allowNoDevice = false) {
         Playlist none = mk(0, PlayAll, -1);
         check(PlaylistNext(one) == -1, "a one-item queue stops in SEQ", nullptr);
         check(PlaylistNext(none) == -1, "an empty queue never advances", nullptr);
+
+        // what the preload predicts must be exactly what the advance then plays
+        {
+            bool agree = true;
+            for (int mode = 0; mode < kPlayModeCount && agree; ++mode) {
+                for (int n = 1; n <= 4 && agree; ++n) {
+                    for (int cur = -1; cur < n && agree; ++cur) {
+                        Playlist a = mk(n, (PlayMode)mode, cur);
+                        Playlist b = mk(n, (PlayMode)mode, cur);
+                        if (a.mode == PlayShuffle) {          // prime the order: a peek never rebuilds one
+                            ShuffleReset(a, -1);
+                            ShuffleReset(b, -1);
+                        }
+                        if (PlaylistPeek(a) != PlaylistNext(b)) agree = false;
+                    }
+                }
+            }
+            check(agree, "preload peek == the advance that follows it (all modes)", nullptr);
+        }
     }
 
     // ---- playback speed: tape-style resampling, 0.50x - 2.00x
@@ -1937,8 +2139,10 @@ int main(int argc, char** argv) {
     int  shotFrames = 60;
     bool selfTest = false, genDemo = false, autoplay = false, autoswap = false;
     bool playlistTest = false, dropTest = false, jitterTest = false;
+    bool gaplessTest = false, resumeTest = false;
     bool allowNoDevice = false, mixerOpen = false, noPanels = false;
     std::string browserDir;
+    std::string resumePath;                  // --resume-test: the file it parks and reloads
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1956,12 +2160,15 @@ int main(int argc, char** argv) {
         else if (a == "--playlist-test")             { playlistTest = true; autoplay = false; }
         else if (a == "--drop-test")                 { dropTest = true; autoplay = true; }
         else if (a == "--jitter-test")               { jitterTest = true; autoplay = true; }
+        else if (a == "--gapless-test")              { gaplessTest = true; autoplay = false; }
+        else if (a == "--resume-test")               { resumeTest = true; autoplay = false; }
         else if (a.rfind("--", 0) != 0)                initial.push_back(a);
     }
 
     // Screenshot and test runs own their own state: they must never load or save the
     // user's session (they would otherwise queue pt1.wav / demo_c.wav into it).
-    const bool ephemeral = shotPath || autoplay || playlistTest || dropTest || jitterTest || !initial.empty();
+    const bool ephemeral = shotPath || autoplay || playlistTest || dropTest || jitterTest ||
+                           gaplessTest || resumeTest || !initial.empty();
 
     if (selfTest) { SetConsoleOutputCP(CP_UTF8); return RunSelfTest(allowNoDevice); }
 
@@ -2014,6 +2221,28 @@ int main(int argc, char** argv) {
         g_halted[0].store(false);
         StartLoad(0, p1, true);
         Say("playlist test: two 6 s tracks, expecting SEQ advance then a ONE repeat");
+    }
+
+    if (gaplessTest) {
+        std::string       err;
+        const std::string q1 = g_exeDir + "\\gp1.wav", q2 = g_exeDir + "\\gp2.wav";
+        if (!FileExists(q1)) dj::GenerateDemoWav(q1, 6.0, 124.0, 0, g_eng.sampleRate, &err);
+        if (!FileExists(q2)) dj::GenerateDemoWav(q2, 6.0, 124.0, 2, g_eng.sampleRate, &err);
+        g_pl[0].items   = {q1, q2};
+        g_pl[0].current = 0;
+        g_pl[0].mode    = PlaySeq;
+        g_halted[0].store(false);
+        StartLoad(0, q1, true);
+        Say("gapless test: playing gp1, expecting gp2 preloaded and handed over without a decode");
+    }
+
+    if (resumeTest) {
+        std::string       err;
+        const std::string rp = g_exeDir + "\\demo_a.wav";
+        if (!FileExists(rp)) dj::GenerateDemoWav(rp, 45.0, 124.0, 0, g_eng.sampleRate, &err);
+        resumePath = rp;
+        StartLoad(0, rp);                     // a deliberate load: starts at 0 and stays paused
+        Say("resume test: park demo_a at 12 s, load it again, expect it to resume there");
     }
 
     if (shotPath || autoplay || !initial.empty()) {
@@ -2087,6 +2316,12 @@ int main(int argc, char** argv) {
     bool   plSawEnd  = false;
     bool   dropAccepted = false, dropRefused = false;
     int    dropResult = -1;
+    int    gapStage = 0, gapResult = -1;
+    bool   gapArmed = false, gapPreloaded = false, gapMissedEnd = false;
+    const dj::Track* gapPrev = nullptr, *gapArmedPtr = nullptr;
+    double gapT0 = 0.0, gapStart = dj::NowSeconds();
+    int    resumeStage = 0, resumeResult = -1;
+    double resumePos = -1.0, resumeStart = dj::NowSeconds();
     double jPrev[2] = {-1.0, -1.0}, jWorstBack[2] = {0.0, 0.0}, jMaxFwd[2] = {0.0, 0.0};
     int    jBack[2] = {0, 0}, jFrames = 0, jitterResult = -1;
     while (!done) {
@@ -2106,7 +2341,9 @@ int main(int argc, char** argv) {
         }
 
         CollectRetired();
+        CapturePositions();
         UpdatePlaylists();
+        UpdatePreload();
         for (int i = 0; i < 2; ++i) EnsureWaveTexture(i, g_eng.deck[i].current.load(std::memory_order_acquire));
 
         // auto-start playback once the demo tracks are in (screenshot / autoplay mode)
@@ -2228,6 +2465,84 @@ int main(int argc, char** argv) {
             jitterResult = ok ? 0 : 1;
             g_quit       = true;
         }
+        // ---- gapless handover: the next item must arrive decoded, without a decode pause
+        if (gaplessTest && gapResult < 0) {
+            dj::Deck&        d0  = g_eng.deck[0];
+            const dj::Track* cur = d0.current.load(std::memory_order_acquire);
+            if (gapStage == 0 && cur && d0.playing.load()) {
+                gapPrev  = cur;
+                gapStart = dj::NowSeconds();
+                gapStage = 1;
+            } else if (gapStage == 1) {
+                if (g_staged[0].track) { gapArmed = true; gapArmedPtr = g_staged[0].track; }
+                if (d0.atEnd.load())            { gapT0 = dj::NowSeconds(); gapStage = 2; }
+                else if (cur && cur != gapPrev) { gapT0 = dj::NowSeconds(); gapMissedEnd = true; gapStage = 3; }
+            } else if (gapStage == 2 && cur && cur != gapPrev) {
+                gapPreloaded = gapArmedPtr && cur == gapArmedPtr;
+                gapStage     = 3;
+            }
+            if (gapStage == 3 && cur && cur != gapPrev && d0.playing.load()) {
+                const double gap = dj::NowSeconds() - gapT0;
+                const bool   ok  = gapArmed && gapPreloaded && gap <= 0.15 && g_pl[0].current == 1;
+                printf("[djdeck] GAPLESS HANDOVER: %s | preload armed=%d | handover used the decoded "
+                       "track=%d | gap=%.3fs%s | queue now %d/%d\n",
+                       ok ? "OK" : "FAIL", (int)gapArmed, (int)gapPreloaded, gap,
+                       gapMissedEnd ? " (end latch coalesced into one frame)" : "",
+                       g_pl[0].current + 1, (int)g_pl[0].items.size());
+                gapResult = ok ? 0 : 1;
+                g_quit    = true;
+            } else if (gapResult < 0 && dj::NowSeconds() - gapStart > 30.0) {
+                printf("[djdeck] GAPLESS HANDOVER: FAIL (timeout) | stage=%d armed=%d queue=%d/%d\n",
+                       gapStage, (int)gapArmed, g_pl[0].current + 1, (int)g_pl[0].items.size());
+                gapResult = 1;
+                g_quit    = true;
+            }
+        }
+
+        // ---- resume: park a track, load it again, expect it to pick up where it stopped
+        if (resumeTest && resumeResult < 0) {
+            dj::Deck&        d0   = g_eng.deck[0];
+            const dj::Track* cur  = d0.current.load(std::memory_order_acquire);
+            const dj::Track* want = g_awaiting[0].load();
+            const bool       adopted = cur && (!want || cur == want) && !g_loader[0].busy.load();
+            const double     pos = cur ? double(d0.pos.load(std::memory_order_relaxed)) / cur->sampleRate : 0.0;
+            if (resumeStage == 0 && adopted && pos < 1.0) {
+                d0.RequestSeek(12.0);                    // the user parks it at 12 s
+                g_ui[0].smoothPos = 12.0;
+                resumeStage = 1;
+            } else if (resumeStage == 1 && adopted && fabs(pos - 12.0) < 0.6) {
+                CapturePositions(true);
+                auto it = g_positions.find(resumePath);
+                resumePos = (it != g_positions.end()) ? it->second : -1.0;
+                StartLoad(0, resumePath);                // load the very same file again
+                resumeStage = 2;
+            } else if (resumeStage == 2 && adopted && g_resumeAt[0].load() < 0.0 && fabs(pos - 12.0) < 1.0) {
+                // the resume seek has been applied to the new track: check the session format too
+                const std::string sess = g_exeDir + "\\djdeck_session.txt";
+                const std::string bak  = sess + ".bak";
+                remove(bak.c_str());
+                const bool had = FileExists(sess);
+                if (had) rename(sess.c_str(), bak.c_str());
+                SaveSession();
+                g_positions.clear();
+                LoadSession();
+                auto it2 = g_positions.find(resumePath);
+                const double back = (it2 != g_positions.end()) ? it2->second : -1.0;
+                if (had) { remove(sess.c_str()); rename(bak.c_str(), sess.c_str()); }
+                else     { remove(sess.c_str()); }
+                const bool ok = resumePos > 11.0 && resumePos < 13.0 && fabs(back - resumePos) < 0.01;
+                printf("[djdeck] RESUME: %s | captured=%.2fs | reload played from %.2fs | "
+                       "session file round-trip=%.2fs\n", ok ? "OK" : "FAIL", resumePos, pos, back);
+                resumeResult = ok ? 0 : 1;
+                g_quit       = true;
+            } else if (resumeResult < 0 && dj::NowSeconds() - resumeStart > 30.0) {
+                printf("[djdeck] RESUME: FAIL (timeout) | stage=%d pos=%.2f adopted=%d resumeAt=%.1f\n",
+                       resumeStage, pos, (int)adopted, g_resumeAt[0].load());
+                resumeResult = 1;
+                g_quit       = true;
+            }
+        }
+
         ++frame;
         if (shotPath && frame >= shotFrames) {
             const bool ok = SaveBackbufferPNG(shotPath);
@@ -2241,8 +2556,15 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 2; ++i) {
         g_loader[i].cancel.store(true);
         if (g_loader[i].th.joinable()) g_loader[i].th.join();
+        g_pre[i].cancel.store(true);
+        if (g_pre[i].th.joinable()) g_pre[i].th.join();
+        DiscardStaged(i);
+        if (dj::Track* t = g_pre[i].result.exchange(nullptr)) dj::FreeTrack(t);
     }
-    if (!ephemeral) SaveSession();          // queues, modes, browser folder, mixer state
+    if (!ephemeral) {
+        CapturePositions(true);             // one last sample of where each deck was left
+        SaveSession();                      // queues, modes, positions, browser folder, view state
+    }
     g_eng.Stop();
     for (int i = 0; i < 2; ++i) {
         while (dj::Track* r = g_eng.deck[i].TakeRetired()) dj::FreeTrack(r);
@@ -2256,6 +2578,8 @@ int main(int argc, char** argv) {
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    if (gapResult >= 0)    return gapResult;
+    if (resumeResult >= 0) return resumeResult;
     if (dropResult >= 0)   return dropResult;
     if (jitterResult >= 0) return jitterResult;
     return plTestResult >= 0 ? plTestResult : 0;
