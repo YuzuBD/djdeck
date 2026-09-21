@@ -23,6 +23,7 @@ build/djdeck.exe --drop-test                    # 拖放规则测试（播放中
 build/djdeck.exe --jitter-test                  # 播放中波形位置抖动测试（不允许回退）
 build/djdeck.exe --autoplay --screenshot out.png --frames 320   # 渲染真实 UI 存 PNG
 build/djdeck.exe --autoplay --mixer --screenshot mix.png        # 同上，并打开混音台窗口
+build/djdeck.exe --autoplay --no-panels --screenshot player.png # 同上，并收起浏览器/队列（纯波形）
 build/djdeck.exe --gen-demo DIR                 # 只生成演示 WAV
 build/djdeck.exe --load a.wav b.wav             # 指定两首歌启动
 ```
@@ -98,8 +99,8 @@ build/djdeck.exe --load a.wav b.wav             # 指定两首歌启动
 
 ## 会话持久化
 
-`build/djdeck_session.txt`（与 exe 同目录）保存两条队列、两个播放模式、浏览器目录和混音台开关，
-退出时写入、启动时恢复；测试与截图模式（任何 `--` 参数）都不会读写它。
+`build/djdeck_session.txt`（与 exe 同目录）保存两条队列、两个播放模式、浏览器目录、
+混音台与面板开关，退出时写入、启动时恢复；测试与截图模式（任何 `--` 参数）都不会读写它。
 找不到的文件在恢复时会被跳过，所以移动/删除过的曲目不会让队列废掉。
 
 ## 架构
@@ -154,8 +155,8 @@ tools/                  构建时下载的工具链（已 gitignore）
 | `--playlist-test` | 端到端两段：`SEQ` 播完第一首自动载入第二首并继续播放；切到 `ONE` 后同一首被自动重播 |
 | `--jitter-test` | 播放中逐帧采样显示位置：0 次回退、单帧前进 ≤ 一帧音频量（修复前实测 23 次回退 / 最大 −0.248 s） |
 | `--drop-test` | 暂停音轨接受、播放中音轨拒绝、放下后保持暂停、另一音轨不受影响 |
-| CI | `.github/workflows/windows.yml`：构建 + `--selftest --allow-no-device`（runner 没有声卡） |
-| 截图 | `docs/screenshot.png`（播放器主页）、`docs/mixer.png`（混音台浮窗）、`docs/drop-rule.png`（拖放规则红/绿提示） |
+| CI | `.github/workflows/windows.yml`：构建 + `--selftest --allow-no-device`（万一 runner 没有声卡，设备检查记 SKIP 而不是失败；实测 GitHub 的 runner 有声卡，28 项全部真跑） |
+| 截图 | `docs/screenshot.png`（播放器主页）、`docs/mixer.png`（混音台浮窗）、`docs/player.png`（收起面板的纯波形视图）、`docs/drop-rule.png`（拖放规则红/绿提示） |
 
 ## 已知取舍
 

@@ -410,6 +410,7 @@ static void SaveSession() {
     if (!f) return;
     fprintf(f, "mode %d %d\n", (int)g_pl[0].mode, (int)g_pl[1].mode);
     fprintf(f, "mixer %d\n", g_showMixer ? 1 : 0);
+    fprintf(f, "panels %d\n", g_showPanels ? 1 : 0);
     if (!g_browser.dir.empty()) fprintf(f, "browser %s\n", g_browser.dir.c_str());
     for (int i = 0; i < 2; ++i)
         for (const auto& p : g_pl[i].items) fprintf(f, "item %c %s\n", 'A' + i, p.c_str());
@@ -433,6 +434,8 @@ static void LoadSession() {
             }
         } else if (strncmp(line, "mixer ", 6) == 0) {
             g_showMixer = atoi(line + 6) != 0;
+        } else if (strncmp(line, "panels ", 7) == 0) {
+            g_showPanels = atoi(line + 7) != 0;
         } else if (strncmp(line, "browser ", 8) == 0) {
             if (DirExists(line + 8)) { g_browser.dir = line + 8; g_browser.needScan = true; }
         } else if (strncmp(line, "item A ", 7) == 0) {
@@ -1934,7 +1937,7 @@ int main(int argc, char** argv) {
     int  shotFrames = 60;
     bool selfTest = false, genDemo = false, autoplay = false, autoswap = false;
     bool playlistTest = false, dropTest = false, jitterTest = false;
-    bool allowNoDevice = false, mixerOpen = false;
+    bool allowNoDevice = false, mixerOpen = false, noPanels = false;
     std::string browserDir;
 
     for (int i = 1; i < argc; ++i) {
@@ -1948,6 +1951,7 @@ int main(int argc, char** argv) {
         else if (a == "--autoswap")                  { autoplay = true; autoswap = true; }
         else if (a == "--demo-drag")                   g_demoDrag = true;
         else if (a == "--mixer")                       mixerOpen = true;   // screenshot hook
+        else if (a == "--no-panels")                   noPanels = true;    // screenshot hook
         else if (a == "--allow-no-device")             allowNoDevice = true;
         else if (a == "--playlist-test")             { playlistTest = true; autoplay = false; }
         else if (a == "--drop-test")                 { dropTest = true; autoplay = true; }
@@ -1988,6 +1992,7 @@ int main(int argc, char** argv) {
     // screenshot runs) sets its own state and must not inherit one.
     if (!ephemeral) LoadSession();
     if (mixerOpen) g_showMixer = true;
+    if (noPanels)  g_showPanels = false;
 
     std::string dropPath;
     if (dropTest) {
