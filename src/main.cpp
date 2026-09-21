@@ -668,7 +668,9 @@ static void CollectRetired() {
 // The player controls live in one place: deck row, keyboard shortcuts and the
 // playlist advance all go through these.
 constexpr float kRateMin = 0.5f, kRateMax = 2.0f;   // tape-style resampling range
-constexpr float kTransportH = 40.0f;                // deck transport row (buttons are 30 high)
+// The deck transport row is one frame high plus a gap, taken from the style so the
+// layout stays right whatever the display DPI scale does to the font.
+static float TransportH() { return ImGui::GetFrameHeight() + 10.0f; }
 
 static void SetDeckRate(int i, float rate) {
     rate = std::clamp(rate, kRateMin, kRateMax);
@@ -1047,26 +1049,34 @@ static WaveHit DrawWaveform(int i, ImVec2 topLeft, ImVec2 size, bool overview) {
 // Everything in a deck block except the waveform window: padding, header, the
 // transport row, the gap and the overview strip. The layout above shares this.
 static float DeckChromeH(float hdrH, float waveH, float overviewH) {
-    return 20.0f + hdrH + 8.0f + kTransportH + waveH + 4.0f + overviewH;
+    return 20.0f + hdrH + 8.0f + TransportH() + waveH + 4.0f + overviewH;
 }
 
 // The player controls: play/pause, cue, speed (0.5x - 2.0x), volume, level.
+// Every size here is derived from the style/font instead of being a constant: the UI
+// runs at the display's DPI scale (150% is the common case), and hardcoded pixel sizes
+// leave the labels crowded and off-centre inside their frames.
 static void DrawDeckTransport(int i, ImVec2 topLeft, float width) {
     DeckUI&   u        = g_ui[i];
     dj::Deck& d        = g_eng.deck[i];
     const bool playing = d.playing.load(std::memory_order_relaxed);
-    const float btnH   = 30.0f;
+    const float btnH   = ImGui::GetFrameHeight();
+    const float fpad   = ImGui::GetStyle().FramePadding.x;
+    auto textW = [](const char* s) { return ImGui::CalcTextSize(s).x; };
     ImGui::SetCursorScreenPos(topLeft);
     ImGui::PushID(i + 800);
 
     ImGui::PushStyleColor(ImGuiCol_Button, playing ? IM_COL32(200, 70, 60, 255) : IM_COL32(52, 110, 70, 255));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
                           playing ? IM_COL32(225, 85, 72, 255) : IM_COL32(64, 130, 84, 255));
-    if (ImGui::Button(playing ? "PAUSE" : "PLAY", ImVec2(92, btnH))) TogglePlay(i);
+    if (ImGui::Button(playing ? "PAUSE" : "PLAY",
+                      ImVec2(std::max(textW("PAUSE"), textW("PLAY")) + fpad * 2.0f, btnH)))
+        TogglePlay(i);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("播放 / 暂停  (Space)");
     ImGui::PopStyleColor(2);
     ImGui::SameLine(0.0f, 8.0f);
-    if (ImGui::Button("CUE", ImVec2(64, btnH))) CueDeck(i);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("回到开头并暂停");
+    if (ImGui::Button("CUE", ImVec2(0, btnH))) CueDeck(i);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("回到开头并暂停  (Q)");
 
     // speed: tape-style resampling, so the pitch follows the rate
     ImGui::SameLine(0.0f, 18.0f);
@@ -1074,23 +1084,23 @@ static void DrawDeckTransport(int i, ImVec2 topLeft, float width) {
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("SPEED");
     ImGui::SameLine(0.0f, 8.0f);
-    if (ImGui::Button("-##spd", ImVec2(28, btnH))) SetDeckRate(i, rate - 0.05f);
+    if (ImGui::Button("-##spd", ImVec2(0, btnH))) SetDeckRate(i, rate - 0.05f);
     ImGui::SameLine(0.0f, 4.0f);
     char rtxt[24];
     snprintf(rtxt, sizeof(rtxt), "%.2fx", double(rate));
-    ImGui::Button(rtxt, ImVec2(72, btnH));
-    if (ImGui::IsItemClicked()) SetDeckRate(i, 1.0f);        // the readout doubles as "reset"
+    if (ImGui::Button(rtxt, ImVec2(textW("0.00x") + fpad * 2.0f, btnH)))
+        SetDeckRate(i, 1.0f);                       // the readout doubles as "reset"
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("点击回到 1.00x  ( - / = 调整当前音轨 )");
     ImGui::SameLine(0.0f, 4.0f);
-    if (ImGui::Button("+##spd", ImVec2(28, btnH))) SetDeckRate(i, rate + 0.05f);
+    if (ImGui::Button("+##spd", ImVec2(0, btnH))) SetDeckRate(i, rate + 0.05f);
 
-    static const float kPreset[5]  = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+    static const float kPreset[5]    = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
     static const char* kPresetLbl[5] = {"0.75x", "1x", "1.25x", "1.5x", "2x"};
     for (int k = 0; k < 5; ++k) {
         ImGui::SameLine(0.0f, 6.0f);
         const bool on = fabsf(rate - kPreset[k]) < 0.001f;
         if (on) ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 110, 165, 255));
-        if (ImGui::Button(kPresetLbl[k], ImVec2(48, btnH))) SetDeckRate(i, kPreset[k]);
+        if (ImGui::Button(kPresetLbl[k], ImVec2(0, btnH))) SetDeckRate(i, kPreset[k]);
         if (on) ImGui::PopStyleColor();
     }
 
@@ -1100,12 +1110,17 @@ static void DrawDeckTransport(int i, ImVec2 topLeft, float width) {
     ImGui::TextDisabled("VOL");
     ImGui::SameLine(0.0f, 8.0f);
     float db = d.faderDb.load(std::memory_order_relaxed);
-    ImGui::SetNextItemWidth(150.0f);
+    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 7.0f);
     if (ImGui::SliderFloat("##vol", &db, -40.0f, 6.0f, db <= -39.5f ? "-inf dB" : "%+.0f dB"))
         d.faderDb.store(db);
 
     ImGui::SameLine(0.0f, 14.0f);
-    LevelMeter("dmeter", u.meter[0], u.meter[1], u.hold[0], u.hold[1], ImVec2(56, btnH - 6.0f));
+    {
+        const float  mH = btnH * 0.8f;
+        const ImVec2 mp = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(mp.x, topLeft.y + (btnH - mH) * 0.5f));
+        LevelMeter("dmeter", u.meter[0], u.meter[1], u.hold[0], u.hold[1], ImVec2(56.0f, mH));
+    }
     ImGui::PopID();
 }
 
@@ -1143,15 +1158,23 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
         ImGui::SameLine();
     }
 
-    const float rightButtonsW = 430.0f;
-    ImGui::SetCursorScreenPos(ImVec2(a.x + width - pad - rightButtonsW, a.y + pad - 2.0f));
+    const double pos = t ? double(d.pos.load(std::memory_order_relaxed)) / t->sampleRate : 0.0;
+    char tbuf[32], ttot[32];
+    FmtTime(pos, tbuf, sizeof(tbuf));
+    FmtTime(t ? t->seconds() : 0.0, ttot, sizeof(ttot));
+    const float fpadH = ImGui::GetStyle().FramePadding.x;
+    const float gapH  = ImGui::GetStyle().ItemSpacing.x;
+    auto btnW = [&](const char* s) { return ImGui::CalcTextSize(s).x + fpadH * 2.0f; };
+    const float timeW  = ImGui::CalcTextSize("0:00.000 / 0:00.000").x;
+    const float rightW = btnW("LOAD") + btnW("RECENT") + btnW("EJECT") + timeW + gapH * 4.0f;
+    ImGui::SetCursorScreenPos(ImVec2(a.x + width - pad - rightW, a.y + pad - 2.0f));
 
-    if (ImGui::Button("LOAD", ImVec2(70, 0))) {
+    if (ImGui::Button("LOAD", ImVec2(0, 0))) {
         std::string p;
         if (PickFile(&p)) StartLoad(i, p);
     }
     ImGui::SameLine();
-    if (ImGui::Button("RECENT", ImVec2(78, 0))) ImGui::OpenPopup("##recent");
+    if (ImGui::Button("RECENT", ImVec2(0, 0))) ImGui::OpenPopup("##recent");
     if (ImGui::BeginPopup("##recent")) {
         for (auto& r : g_recent) {
             const char* slash = strrchr(r.c_str(), '\\');
@@ -1162,7 +1185,7 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
         ImGui::EndPopup();
     }
     ImGui::SameLine();
-    if (ImGui::Button("EJECT", ImVec2(70, 0))) {
+    if (ImGui::Button("EJECT", ImVec2(0, 0))) {
         d.ejectReq.store(true);
         DiscardStaged(i);
         g_awaiting[i].store(nullptr);
@@ -1174,10 +1197,6 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
         Say("deck %c: ejected", 'A' + i);
     }
     ImGui::SameLine();
-    const double pos = t ? double(d.pos.load(std::memory_order_relaxed)) / t->sampleRate : 0.0;
-    char tbuf[32], ttot[32];
-    FmtTime(pos, tbuf, sizeof(tbuf));
-    FmtTime(t ? t->seconds() : 0.0, ttot, sizeof(ttot));
     ImGui::Text("%s / %s", tbuf, ttot);
     ImGui::PopID();
 
@@ -1205,7 +1224,7 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
 
     // -------- waveform + overview  (position is advanced exactly once per deck per frame)
     UpdateDeckPosition(i);
-    const ImVec2 wavePos(a.x + pad, ty + kTransportH);
+    const ImVec2 wavePos(a.x + pad, ty + TransportH());
     const ImVec2 waveSize(width - pad * 2.0f, waveH);
     DrawWaveform(i, wavePos, waveSize, false);
     DrawWaveform(i, ImVec2(wavePos.x, wavePos.y + waveH + 4.0f),
@@ -1218,8 +1237,8 @@ static void DrawDeck(int i, ImVec2 topLeft, float width, float waveH, float over
 //   y0+0   (30)  LOOP 8s | FADE IN n s | FADE OUT n s
 //   y0+42        GAIN + LOW/MID/HIGH knobs (label / 48 px dial / value), LEVEL meter right
 // The player-side controls (play, cue, speed, volume) live on the deck itself.
-static constexpr float kStripW = 384.0f;
-static constexpr float kMixerH = 248.0f;
+static float StripW()    { return ImGui::GetFontSize() * 17.0f; }
+static float MixerH()    { return ImGui::GetFontSize() * 9.7f; }
 
 static void DrawMixer(ImVec2 topLeft, float width, float height) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1228,11 +1247,12 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
     PanelBg(dl, a, b, IM_COL32(26, 27, 33, 255), 10.0f);
 
     const float pad     = 14.0f;
-    const float stripW  = kStripW;
+    const float stripW  = StripW();
     const float centerW = std::max(200.0f, width - stripW * 2.0f - pad * 2.0f);
     const float lineH   = ImGui::GetTextLineHeight();
-    const float knobSz  = 48.0f;
-    const float knobGap = 10.0f;
+    const float btnH    = ImGui::GetFrameHeight();
+    const float knobSz  = ImGui::GetFontSize() * 1.85f;
+    const float knobGap = ImGui::GetFontSize() * 0.4f;
 
     auto place = [](float x, float y) { ImGui::SetCursorScreenPos(ImVec2(x, y)); };
 
@@ -1255,7 +1275,7 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         place(x0, y0);
         const bool loopOn = d.loopOn.load();
         if (loopOn) ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(70, 110, 165, 255));
-        if (ImGui::Button(loopOn ? "LOOP 8s ON" : "LOOP 8s", ImVec2(100, 30))) {
+        if (ImGui::Button(loopOn ? "LOOP 8s ON" : "LOOP 8s", ImVec2(0, btnH))) {
             const bool on = !loopOn;
             if (on && t) {
                 const uint64_t p   = d.pos.load();
@@ -1271,14 +1291,14 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         char fl[24], fr[24];
         snprintf(fl, sizeof(fl), "FADE IN %.0fs", g_fadeSecs);
         snprintf(fr, sizeof(fr), "FADE OUT %.0fs", g_fadeSecs);
-        if (ImGui::Button(fl, ImVec2(130, 30)))
+        if (ImGui::Button(fl, ImVec2(0, btnH)))
             d.ArmFade(1.0f, (uint32_t)(g_fadeSecs * g_eng.sampleRate), false);
         ImGui::SameLine(0.0f, 8.0f);
-        if (ImGui::Button(fr, ImVec2(130, 30)))
+        if (ImGui::Button(fr, ImVec2(0, btnH)))
             d.ArmFade(0.0f, (uint32_t)(g_fadeSecs * g_eng.sampleRate), true);
 
         // ---- row 1: channel trim + 3-band EQ, level meter on the right
-        const float row2 = y0 + 42.0f;
+        const float row2 = y0 + btnH + 12.0f;
         place(x0, row2);
         {
             float gain = d.faderDb.load();
@@ -1302,7 +1322,7 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         ImGui::TextDisabled("LEVEL");
         place(x0 + stripW - 62.0f, row2 + lineH);
         LevelMeter("meter", g_ui[i].meter[0], g_ui[i].meter[1],
-                   g_ui[i].hold[0], g_ui[i].hold[1], ImVec2(46, 92));
+                   g_ui[i].hold[0], g_ui[i].hold[1], ImVec2(46.0f, knobSz * 1.9f));
         ImGui::PopID();
     }
 
@@ -1311,9 +1331,9 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         const float cx = a.x + pad + stripW + std::max(0.0f, (centerW - 300.0f) * 0.5f);
         float       y  = a.y + pad;
         ImGui::PushID(777);
-        place(cx, y);
+        place(cx, y + ImGui::GetStyle().FramePadding.y);
         ImGui::TextDisabled("CROSSFADER");
-        place(cx + 190.0f, y - 2.0f);
+        place(cx + ImGui::GetFontSize() * 7.3f, y);
         if (ImGui::SmallButton("XFADE >")) {
             const int from = g_eng.xfader.load() < 0.5f ? 0 : 1;
             const int to   = 1 - from;
@@ -1329,15 +1349,16 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
                 Say("auto-mix: %c -> %c over %.1fs", 'A' + from, 'A' + to, g_fadeSecs * 1.5f);
             }
         }
-        y += 22.0f;
+        y += lineH + 4.0f;
         place(cx, y);
         float xf = g_eng.xfader.load();
-        if (HFader("xf", &xf, ImVec2(240, 34), "A", "B")) g_eng.xfader.store(xf);
+        if (HFader("xf", &xf, ImVec2(ImGui::GetFontSize() * 9.2f, 34.0f), "A", "B"))
+            g_eng.xfader.store(xf);
 
-        y += 34.0f + 26.0f;                          // track + the A/B label line under it
+        y += 34.0f + lineH + 6.0f;                   // track + the A/B label line under it
         place(cx, y);
         float fadeSec = g_fadeSecs;
-        ImGui::PushItemWidth(150.0f);
+        ImGui::PushItemWidth(ImGui::GetFontSize() * 5.8f);
         if (ImGui::SliderFloat("fade (s)", &fadeSec, 1.0f, 16.0f, "%.0f")) g_fadeSecs = fadeSec;
         ImGui::PopItemWidth();
 
@@ -1361,20 +1382,21 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
 // The mixer is a secondary panel now: closed by default, opened from the top bar
 // (or M), floating above the player page. Its own window keeps the main page clean
 // and leaves the full height to the waveforms.
-static constexpr float kMixerW = kStripW * 2.0f + 348.0f;   // two strips + the centre column
-
 static void DrawMixerWindow() {
     if (!g_showMixer) return;
     const ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(kMixerW, kMixerH + 46.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowPos(ImVec2(std::max(0.0f, io.DisplaySize.x - kMixerW - 40.0f),
-                                   std::max(0.0f, io.DisplaySize.y - kMixerH - 150.0f)),
+    const float    w  = StripW() * 2.0f + ImGui::GetFontSize() * 13.4f;   // strips + centre column
+    const float    h  = MixerH();
+    // Centred over the waveform area: the old bottom-right default covered playlist B.
+    ImGui::SetNextWindowSize(ImVec2(w, h + 46.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(std::max(0.0f, (io.DisplaySize.x - w) * 0.5f),
+                                   std::max(0.0f, (io.DisplaySize.y - h) * 0.42f)),
                             ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MIXER  混音台", &g_showMixer,
                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
         const ImVec2 o = ImGui::GetCursorScreenPos();
-        DrawMixer(o, kMixerW, kMixerH);
-        ImGui::Dummy(ImVec2(kMixerW, kMixerH));
+        DrawMixer(o, w, h);
+        ImGui::Dummy(ImVec2(w, h));
     }
     ImGui::End();
 }
@@ -1391,8 +1413,9 @@ static void DrawBrowserPanel(ImVec2 topLeft, ImVec2 size) {
     const float footH = ImGui::GetFrameHeight() + 10.0f;
     ImGui::PushID(4242);
     ImGui::SetCursorScreenPos(ImVec2(a.x + pad, a.y + pad));
+    ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("FILES");
-    ImGui::SameLine();
+    ImGui::SameLine(0.0f, 6.0f);
     if (ImGui::SmallButton("up")) {
         const size_t s = g_browser.dir.find_last_of('\\');
         if (s != std::string::npos && s >= 3) {
@@ -1403,7 +1426,12 @@ static void DrawBrowserPanel(ImVec2 topLeft, ImVec2 size) {
     ImGui::SameLine();
     if (ImGui::SmallButton("refresh")) g_browser.needScan = true;
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", g_browser.dir.c_str());
+    ImGui::AlignTextToFramePadding();
+    {
+        char dir[80];
+        snprintf(dir, sizeof(dir), "%.52s", g_browser.dir.c_str());
+        ImGui::TextDisabled("%s", dir);
+    }
 
     const float listTop = a.y + pad + ImGui::GetFrameHeight() + 6.0f;
     const float listH   = std::max(40.0f, b.y - footH - listTop);
@@ -1465,9 +1493,15 @@ static void DrawPlaylistPanel(int i, ImVec2 topLeft, ImVec2 size) {
     const float footH = ImGui::GetFrameHeight() + 10.0f;
     ImGui::PushID(5000 + i);
     ImGui::SetCursorScreenPos(ImVec2(a.x + pad, a.y + pad));
-    ImGui::PushStyleColor(ImGuiCol_Text, i == 0 ? IM_COL32(150, 200, 255, 255) : IM_COL32(255, 180, 130, 255));
-    ImGui::Text("PLAYLIST %c", 'A' + i);
-    ImGui::PopStyleColor();
+    ImGui::AlignTextToFramePadding();
+    {
+        char hdr[32];
+        snprintf(hdr, sizeof(hdr), "PLAYLIST %c", 'A' + i);
+        ImGui::PushStyleColor(ImGuiCol_Text, i == 0 ? IM_COL32(150, 200, 255, 255)
+                                                    : IM_COL32(255, 180, 130, 255));
+        ImGui::TextUnformatted(hdr);
+        ImGui::PopStyleColor();
+    }
     ImGui::SameLine(0.0f, 12.0f);
     {   // how this queue continues when a track ends on a deck nobody paused
         int m = (int)pl.mode;
@@ -1476,7 +1510,12 @@ static void DrawPlaylistPanel(int i, ImVec2 topLeft, ImVec2 size) {
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kPlayModeTip[(int)pl.mode]);
     }
     ImGui::SameLine(0.0f, 10.0f);
-    ImGui::TextDisabled("%d tracks", (int)pl.items.size());
+    ImGui::AlignTextToFramePadding();
+    {
+        char cnt[32];
+        snprintf(cnt, sizeof(cnt), "%d tracks", (int)pl.items.size());
+        ImGui::TextDisabled("%s", cnt);
+    }
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("把文件拖到这里加入队列;列表内拖动可排序");
 
     const float listTop = a.y + pad + ImGui::GetFrameHeight() + 6.0f;
@@ -1566,6 +1605,7 @@ static void DrawPlaylistPanel(int i, ImVec2 topLeft, ImVec2 size) {
         pl.selected = -1;
     }
     ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled(d.atEnd.load() ? "ended" : (d.playing.load() ? "playing" : "paused"));
     ImGui::PopID();
 }

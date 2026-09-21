@@ -46,6 +46,9 @@ build/djdeck.exe --load a.wav b.wav             # 指定两首歌启动
 状态栏：设备 / 采样率 / 块大小 / CPU / callback
 ```
 
+行高、按钮宽度、滑块长度都取自 ImGui 的样式与字体尺寸（`GetFrameHeight()`、`CalcTextSize()`），
+不是写死的像素值——所以 150% 显示缩放下文字依然在按钮里居中，而不会挤在下缘。
+
 **混音台**是独立浮窗（顶栏 MIXER 按钮或 `M`），关掉不影响播放：
 
 ```
