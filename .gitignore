@@ -1,0 +1,18 @@
+# build output (exe, objects, generated demo audio, session state, screenshots)
+build/
+*.o
+*.obj
+*.exe
+
+# vendored LLVM-MinGW toolchain: build.sh fetches it on demand (~190 MB download)
+tools/
+
+# generated demo audio + session state
+*.wav
+djdeck_recent.txt
+
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
