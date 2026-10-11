@@ -40,6 +40,16 @@ static std::string BaseName(const std::string& p) {
     return s == std::string::npos ? p : p.substr(s + 1);
 }
 
+// fopen() on Windows uses the ANSI codepage; paths here are UTF-8.
+static std::wstring Utf8ToWidePath(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
 static void BuildPeaks(Track& t) {
     uint64_t w = t.frames / 128;
     w = std::min<uint64_t>(std::max<uint64_t>(w, 1024), 16384);
@@ -155,7 +165,9 @@ Track* LoadTrack(const std::string& path, uint32_t outRate, std::string* err) {
     tracksLoaded.fetch_add(1, std::memory_order_relaxed);
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 2, outRate);
     ma_decoder        dec;
-    ma_result         r = ma_decoder_init_file(path.c_str(), &cfg, &dec);
+    // The path is UTF-8; miniaudio's char* file API goes through CreateFileA (ANSI), so
+    // use the wide entry point and hand it the UTF-16 path instead.
+    ma_result         r = ma_decoder_init_file_w(Utf8ToWidePath(path).c_str(), &cfg, &dec);
     if (r != MA_SUCCESS) {
         if (err) *err = std::string("cannot open: ") + ma_result_description(r);
         return nullptr;
@@ -249,7 +261,7 @@ bool GenerateDemoWav(const std::string& path, double seconds, double bpm, int st
         pcm[i * 2 + 1] = (int16_t)lrint(std::max(-32768.0, std::min(32767.0, r * 32767.0)));
     }
 
-    FILE* f = fopen(path.c_str(), "wb");
+    FILE* f = _wfopen(Utf8ToWidePath(path).c_str(), L"wb");
     if (!f) { if (err) *err = "cannot write " + path; return false; }
     const uint32_t dataBytes = (uint32_t)(frames * 2 * 2);
     const uint32_t riffSize  = 36 + dataBytes;
@@ -473,7 +485,7 @@ bool Deck::RetireEmpty() const {
 }
 
 void Deck::ResetTransport() {
-    frac = 0.0; chan = 0.0f; env = 1.0f; envStep = 0.0f; envLeft = 0;
+    frac = 0.0; chan = 0.0f; env = 1.0f; envStep = 0.0f; envTarget = 1.0f; envLeft = 0;
     dk = 1.0f; dkStep = 0.0f; dkLeft = 0; jumpPending = false;
     lastFadeSeq = fadeSeq.load(std::memory_order_relaxed);
     playing.store(false, std::memory_order_relaxed);
@@ -517,6 +529,7 @@ uint32_t Engine::renderChunk(float* out, uint32_t n) {
             d.lastFadeSeq = fs;
             const float    tt = d.fadeTarget.load(std::memory_order_relaxed);
             const uint32_t nf = d.fadeFrames.load(std::memory_order_relaxed);
+            d.envTarget = tt;
             if (nf == 0) { d.env = tt; d.envLeft = 0; }
             else         { d.envStep = (tt - d.env) / (float)nf; d.envLeft = nf; }
         }
@@ -580,7 +593,10 @@ uint32_t Engine::renderChunk(float* out, uint32_t n) {
             if (d.envLeft) {
                 d.env += d.envStep;
                 if (--d.envLeft == 0) {
-                    d.env = d.envStep > 0.0f ? 1.0f : 0.0f;
+                    // Finish on the fade's target. Deriving it from the sign of envStep
+                    // instead snapped the envelope to 0 whenever the target equalled the
+                    // current level (envStep == 0) - silence with the transport still rolling.
+                    d.env = d.envTarget;
                     if (d.env <= 0.0f && d.stopWhenFaded.load(std::memory_order_relaxed))
                         d.playing.store(false, std::memory_order_relaxed);
                 }

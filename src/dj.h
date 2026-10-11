@@ -134,6 +134,7 @@ struct Deck {
     double   frac     = 0.0;
     float    chan     = 0.0f;                    // smoothed fader gain
     float    env      = 1.0f, envStep = 0.0f;
+    float    envTarget = 1.0f;                   // where the running fade must land
     uint32_t envLeft  = 0;
     float    dk       = 1.0f, dkStep = 0.0f;     // declick ramp around seeks
     uint32_t dkLeft   = 0;

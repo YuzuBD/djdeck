@@ -7,6 +7,7 @@
 //   djdeck --gendemo DIR       write demo_a.wav / demo_b.wav and exit
 //   djdeck --load A.wav B.wav  start with two specific files
 #include <windows.h>
+#include <shellapi.h>   // CommandLineToArgvW
 #include <d3d11.h>
 #include <commdlg.h>
 #include <shlobj.h>   // SHBrowseForFolderW (classic folder picker)
@@ -300,19 +301,43 @@ static void Say(const char* fmt, ...) {
     }
 }
 
+// Paths are held as UTF-8 throughout - that is what ImGui draws and what miniaudio
+// expects on Windows. The Win32 calls are the wide (W) variants, converted at the
+// boundary, so the ANSI codepage (GBK on a Chinese system) never leaks in.
+static std::string WideToUtf8(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) return std::wstring();
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+// fopen() on Windows uses the ANSI codepage and would choke on a UTF-8 path.
+static FILE* OpenUtf8(const std::string& path, const wchar_t* mode) {
+    return _wfopen(Utf8ToWide(path).c_str(), mode);
+}
+
 static std::string ExeDir() {
     wchar_t buf[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, buf, MAX_PATH);
     std::wstring w(buf);
     size_t s = w.find_last_of(L"\\/");
     std::wstring dir = (s == std::wstring::npos) ? L"." : w.substr(0, s);
-    std::string out;
-    out.assign(dir.begin(), dir.end());  // ASCII-safe enough for a demo path
-    return out;
+    return WideToUtf8(dir);
 }
 
 static bool FileExists(const std::string& p) {
-    return GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+    return GetFileAttributesW(Utf8ToWide(p).c_str()) != INVALID_FILE_ATTRIBUTES;
 }
 
 static void FmtTime(double s, char* out, size_t n) {
@@ -324,7 +349,7 @@ static void FmtTime(double s, char* out, size_t n) {
 
 // ------------------------------------------------------------------ file browser
 static bool DirExists(const std::string& p) {
-    const DWORD a = GetFileAttributesA(p.c_str());
+    const DWORD a = GetFileAttributesW(Utf8ToWide(p).c_str());
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
@@ -348,11 +373,11 @@ static std::string LowerOf(const std::string& s) {
 
 static void ScanBrowser() {
     g_browser.entries.clear();
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA((g_browser.dir + "\\*").c_str(), &fd);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(Utf8ToWide(g_browser.dir + "\\*").c_str(), &fd);
     if (h != INVALID_HANDLE_VALUE) {
         do {
-            const std::string name = fd.cFileName;
+            const std::string name = WideToUtf8(fd.cFileName);
             if (name == "." || name == "..") continue;
             const bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
             if (!isDir && !HasAudioExt(name)) continue;
@@ -362,7 +387,7 @@ static void ScanBrowser() {
             e.path  = g_browser.dir + "\\" + name;
             e.size  = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
             g_browser.entries.push_back(e);
-        } while (FindNextFileA(h, &fd));
+        } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
     std::sort(g_browser.entries.begin(), g_browser.entries.end(),
@@ -375,8 +400,8 @@ static void ScanBrowser() {
 }
 
 static void InitBrowser() {
-    const char* up = getenv("USERPROFILE");
-    std::string music = up ? (std::string(up) + "\\Music") : g_exeDir;
+    const wchar_t* up = _wgetenv(L"USERPROFILE");
+    std::string music = up ? (WideToUtf8(up) + "\\Music") : g_exeDir;
     g_browser.dir      = DirExists(music) ? music : g_exeDir;
     g_browser.needScan = true;
 }
@@ -393,8 +418,7 @@ static bool PickFile(std::string* out) {
     ofn.nMaxFile    = 2048;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return false;
-    std::wstring w(buf);
-    out->assign(w.begin(), w.end());
+    *out = WideToUtf8(std::wstring(buf));
     return true;
 }
 
@@ -412,8 +436,7 @@ static bool PickFolder(std::string* out) {
     const bool ok = SHGetPathFromIDListW(idl, path) != FALSE;
     CoTaskMemFree(idl);
     if (!ok) return false;
-    std::wstring w(path);
-    out->assign(w.begin(), w.end());
+    *out = WideToUtf8(std::wstring(path));
     return true;
 }
 
@@ -422,14 +445,14 @@ static void AddRecent(const std::string& p) {
     if (it != g_recent.end()) g_recent.erase(it);
     g_recent.insert(g_recent.begin(), p);
     if (g_recent.size() > 10) g_recent.resize(10);
-    FILE* f = fopen((g_exeDir + "\\djdeck_recent.txt").c_str(), "w");
+    FILE* f = OpenUtf8(g_exeDir + "\\djdeck_recent.txt", L"w");
     if (f) {
         for (auto& r : g_recent) fprintf(f, "%s\n", r.c_str());
         fclose(f);
     }
 }
 static void LoadRecents() {
-    FILE* f = fopen((g_exeDir + "\\djdeck_recent.txt").c_str(), "r");
+    FILE* f = OpenUtf8(g_exeDir + "\\djdeck_recent.txt", L"r");
     if (!f) return;
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
@@ -445,7 +468,7 @@ static void LoadRecents() {
 // (djdeck_session.txt next to the exe). The audio settings stay untouched: this is
 // about not losing the queue when the window closes.
 static void SaveSession() {
-    FILE* f = fopen((g_exeDir + "\\djdeck_session.txt").c_str(), "w");
+    FILE* f = OpenUtf8(g_exeDir + "\\djdeck_session.txt", L"w");
     if (!f) return;
     fprintf(f, "mode %d %d\n", (int)g_pl[0].mode, (int)g_pl[1].mode);
     fprintf(f, "mixer %d\n", g_showMixer ? 1 : 0);
@@ -462,7 +485,7 @@ static void SaveSession() {
 }
 
 static void LoadSession() {
-    FILE* f = fopen((g_exeDir + "\\djdeck_session.txt").c_str(), "r");
+    FILE* f = OpenUtf8(g_exeDir + "\\djdeck_session.txt", L"r");
     if (!f) return;
     char line[1024];
     int  nA = 0, nB = 0;
@@ -1988,6 +2011,26 @@ static int RunSelfTest(bool allowNoDevice = false) {
     check(rmsFaded < 0.03, "fade-out reaches silence", "rms=%.5f", rmsFaded);
     check(!e.deck[0].playing.load(), "fade-out auto-pauses the deck", "");
 
+    // ---- a fade armed at the level it already holds must not collapse (regression:
+    //      the zero-length step used to be read as a fade-down and slam env to 0)
+    {
+        dj::Engine en;
+        en.InitOffline(48000);
+        en.masterGain.store(1.0f);
+        en.xfader.store(0.0f);
+        en.deck[0].pending.store(dj::MakeSineTrack(20.0, 1000.0, 48000, 0.5f));
+        std::vector<float> b(1024 * 2);
+        en.RenderBlock(b.data(), 1024);                    // adopt -> envelope == 1
+        en.deck[0].playing.store(true);
+        en.deck[0].ArmFade(1.0f, 4800, false);             // target == current envelope
+        for (int i = 0; i < 10; ++i) en.RenderBlock(b.data(), 1024);   // well past the fade
+        const double rmsHold = RmsOf(b);
+        check(rmsHold > 0.2, "a fade to the current level does not mute the deck",
+              "rms=%.4f after the fade", rmsHold);
+        if (dj::Track* r = en.deck[0].current.exchange(nullptr)) dj::FreeTrack(r);
+        while (dj::Track* r = en.deck[0].TakeRetired()) dj::FreeTrack(r);
+    }
+
     // ---- seek is click-free (self-calibrating against the continuous signal)
     e.deck[0].ArmFade(1.0f, 0, false);
     e.deck[0].RequestSeek(0.0);
@@ -2283,7 +2326,23 @@ static bool OwnsConsole() {
 
 int main(int argc, char** argv) {
     g_exeDir = ExeDir();
+    SetConsoleOutputCP(CP_UTF8);   // printf of the UTF-8 names below stays readable
     const char* shotPath = nullptr;
+    std::string shotPathBuf;
+    // The CRT hands us ANSI (codepage) bytes; re-derive the arguments from the Unicode
+    // command line so a dragged-on or typed Chinese filename arrives as valid UTF-8.
+    std::vector<std::string> arg;
+    {
+        int       wn = 0;
+        wchar_t** wv = CommandLineToArgvW(GetCommandLineW(), &wn);
+        if (wv && wn > 0) {
+            for (int i = 0; i < wn; ++i) arg.push_back(WideToUtf8(wv[i]));
+            LocalFree(wv);
+        } else {
+            for (int i = 0; i < argc; ++i) arg.push_back(argv[i]);
+        }
+    }
+    const int nArg = (int)arg.size();
     std::vector<std::string> initial;
     int  shotFrames = 60;
     bool selfTest = false, genDemo = false, autoplay = false, autoswap = false;
@@ -2293,13 +2352,13 @@ int main(int argc, char** argv) {
     std::string browserDir;
     std::string resumePath;                  // --resume-test: the file it parks and reloads
 
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+    for (int i = 1; i < nArg; ++i) {
+        const std::string a = arg[i];
         if (a == "--selftest")              selfTest = true;
-        else if (a == "--gen-demo" && i + 1 < argc) { genDemo = true; g_exeDir = argv[++i]; }
-        else if (a == "--screenshot" && i + 1 < argc) shotPath = argv[++i];
-        else if (a == "--frames" && i + 1 < argc)     shotFrames = atoi(argv[++i]);
-        else if (a == "--browser" && i + 1 < argc)    browserDir = argv[++i];
+        else if (a == "--gen-demo" && i + 1 < nArg) { genDemo = true; g_exeDir = arg[++i]; }
+        else if (a == "--screenshot" && i + 1 < nArg) { shotPathBuf = arg[++i]; shotPath = shotPathBuf.c_str(); }
+        else if (a == "--frames" && i + 1 < nArg)     shotFrames = atoi(arg[++i].c_str());
+        else if (a == "--browser" && i + 1 < nArg)    browserDir = arg[++i];
         else if (a == "--autoplay")                    autoplay = true;
         else if (a == "--autoswap")                  { autoplay = true; autoswap = true; }
         else if (a == "--demo-drag")                   g_demoDrag = true;
