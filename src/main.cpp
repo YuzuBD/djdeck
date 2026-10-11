@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <commdlg.h>
+#include <shlobj.h>   // SHBrowseForFolderW (classic folder picker)
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -165,6 +166,7 @@ static char                    g_status[512] = "ready";
 static std::vector<std::string> g_recent;
 static int                     g_focus = 0;
 static float                   g_fadeSecs = 4.0f;
+static bool                    g_fadeTransport = true;  // fade in/out around play & pause
 static bool                    g_quit = false;
 static std::string             g_exeDir;
 static bool                    g_demoDrag = false;   // screenshot hook: render the drag overlay
@@ -392,6 +394,25 @@ static bool PickFile(std::string* out) {
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetOpenFileNameW(&ofn)) return false;
     std::wstring w(buf);
+    out->assign(w.begin(), w.end());
+    return true;
+}
+
+// Folder picker for the file browser. This must be the *classic* SHBrowseForFolder
+// dialog: the audio backend (miniaudio/WASAPI) leaves the main thread in an MTA
+// apartment, and the modern IFileOpenDialog will hang when called from MTA.
+static bool PickFolder(std::string* out) {
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = GetActiveWindow();
+    bi.lpszTitle = L"选择文件夹";
+    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_EDITBOX;
+    LPITEMIDLIST idl = SHBrowseForFolderW(&bi);
+    if (!idl) return false;
+    wchar_t path[MAX_PATH] = {};
+    const bool ok = SHGetPathFromIDListW(idl, path) != FALSE;
+    CoTaskMemFree(idl);
+    if (!ok) return false;
+    std::wstring w(path);
     out->assign(w.begin(), w.end());
     return true;
 }
@@ -684,12 +705,25 @@ static void TogglePlay(int i) {
         Say("deck %c: nothing loaded", 'A' + i);
         return;
     }
-    if (d.playing.load(std::memory_order_relaxed)) {
-        d.playing.store(false);
+    // With fades on, play/pause ride a fade envelope (the mixer's fade(s) sets the
+    // length) instead of cutting the channel dead; the second press reverses it.
+    const uint32_t fadeFrames = (g_fadeTransport && g_fadeSecs > 0.01f)
+                              ? (uint32_t)(g_fadeSecs * g_eng.sampleRate) : 0u;
+    const bool playing   = d.playing.load(std::memory_order_relaxed);
+    const bool headingUp = d.fadeTarget.load(std::memory_order_relaxed) >= 0.5f;  // fading in / already up
+    if (playing && headingUp) {
         g_halted[i].store(true);
+        if (fadeFrames) { d.ArmFade(0.0f, fadeFrames, true); Say("deck %c: fading out", 'A' + i); }
+        else            { d.playing.store(false);             Say("deck %c: paused", 'A' + i); }
+    } else if (playing) {
+        // already on the way down: pressing again turns the fade back around
+        g_halted[i].store(false);
+        if (fadeFrames) d.ArmFade(1.0f, fadeFrames, false);
+        d.playing.store(true);
+        Say("deck %c: back to play", 'A' + i);
     } else {
         if (d.atEnd.load(std::memory_order_relaxed)) d.RequestSeek(0.0);   // replay from the top
-        d.ArmFade(1.0f, 0, false);
+        d.ArmFade(1.0f, fadeFrames, false);                                // 0 frames == instant
         d.playing.store(true);
         g_halted[i].store(false);
     }
@@ -699,6 +733,35 @@ static void CueDeck(int i) {
     g_eng.deck[i].RequestSeek(0.0);
     g_eng.deck[i].playing.store(false);
     g_halted[i].store(true);
+}
+
+// Fade `to` in and `from` out, then park `from`. One implementation behind the mixer's
+// XFADE button, the X shortcut and the one-key deck switch.
+static bool AutoMix(int from, int to) {
+    dj::Deck&        dt = g_eng.deck[to];
+    const dj::Track* tt = dt.current.load(std::memory_order_acquire);
+    if (!tt) { Say("auto-mix: deck %c has nothing loaded", 'A' + to); return false; }
+    const uint32_t fs = (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate);
+    if (dt.atEnd.load() || dt.pos.load() + 1000 >= tt->frames) dt.RequestSeek(0.0);
+    dt.ArmFade(1.0f, fs, false);
+    dt.playing.store(true);
+    g_halted[to].store(false);
+    g_eng.deck[from].ArmFade(0.0f, fs, true);
+    g_halted[from].store(true);
+    Say("auto-mix: deck %c -> deck %c over %.1fs", 'A' + from, 'A' + to, g_fadeSecs * 1.5f);
+    return true;
+}
+
+// One-key deck switch: the live deck fades out and parks, the other fades in and takes
+// over, and the keyboard focus follows so the shortcuts keep talking to what is audible.
+static void SwitchDecks() {
+    int from = g_focus;
+    if (!g_eng.deck[from].playing.load(std::memory_order_relaxed)) {
+        const int other = 1 - from;
+        if (g_eng.deck[other].playing.load(std::memory_order_relaxed)) from = other;
+    }
+    const int to = 1 - from;
+    if (AutoMix(from, to)) g_focus = to;
 }
 
 // ------------------------------------------------------------------ textures
@@ -1104,6 +1167,16 @@ static void DrawDeckTransport(int i, ImVec2 topLeft, float width) {
         if (on) ImGui::PopStyleColor();
     }
 
+    // keylock: keep the pitch while the rate changes (tape off)
+    ImGui::SameLine(0.0f, 14.0f);
+    bool keylock = d.keylock.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("KEYLOCK", &keylock)) {
+        d.keylock.store(keylock);
+        Say("deck %c: keylock %s", 'A' + i, keylock ? "on (pitch preserved)" : "off (tape)");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("变速不变调:开启后用 time-stretch 保持音高\n关闭 = 磁带式变速(音高随速度)");
+
     // volume: the same channel fader the mixer window shows as GAIN
     ImGui::SameLine(0.0f, 18.0f);
     ImGui::AlignTextToFramePadding();
@@ -1334,21 +1407,8 @@ static void DrawMixer(ImVec2 topLeft, float width, float height) {
         place(cx, y + ImGui::GetStyle().FramePadding.y);
         ImGui::TextDisabled("CROSSFADER");
         place(cx + ImGui::GetFontSize() * 7.3f, y);
-        if (ImGui::SmallButton("XFADE >")) {
-            const int from = g_eng.xfader.load() < 0.5f ? 0 : 1;
-            const int to   = 1 - from;
-            dj::Deck& dt   = g_eng.deck[to];
-            const dj::Track* tt = dt.current.load();
-            if (!tt) Say("nothing loaded on deck %c", 'A' + to);
-            else {
-                if (dt.atEnd.load() || dt.pos.load() + 1000 >= tt->frames) dt.RequestSeek(0.0);
-                dt.ArmFade(1.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), false);
-                dt.playing.store(true);
-                g_halted[to].store(false);
-                g_eng.deck[from].ArmFade(0.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), true);
-                Say("auto-mix: %c -> %c over %.1fs", 'A' + from, 'A' + to, g_fadeSecs * 1.5f);
-            }
-        }
+        if (ImGui::SmallButton("XFADE >")) AutoMix(g_eng.xfader.load() < 0.5f ? 0 : 1,
+                                                   g_eng.xfader.load() < 0.5f ? 1 : 0);
         y += lineH + 4.0f;
         place(cx, y);
         float xf = g_eng.xfader.load();
@@ -1425,6 +1485,15 @@ static void DrawBrowserPanel(ImVec2 topLeft, ImVec2 size) {
     }
     ImGui::SameLine();
     if (ImGui::SmallButton("refresh")) g_browser.needScan = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("folder")) {
+        std::string dir;
+        if (PickFolder(&dir) && DirExists(dir)) {
+            g_browser.dir      = dir;
+            g_browser.needScan = true;
+        }
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("选择文件浏览器目录");
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     {
@@ -1718,6 +1787,14 @@ static void DrawUI() {
         ImGui::SameLine(0.0f, 6.0f);
         if (ImGui::Button(g_showPanels ? "PANELS  ON" : "PANELS")) g_showPanels = !g_showPanels;
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("文件浏览器 + 播放列表");
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::Button(g_fadeTransport ? "FADES  ON" : "FADES")) g_fadeTransport = !g_fadeTransport;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("播放/暂停渐入渐出 (时长取混音台的 fade(s))");
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::Button("SWITCH A/B")) SwitchDecks();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("一键切 deck:当前渐出并暂停,另一条渐入播放 (S)");
         ImGui::SameLine(0.0f, 14.0f);
 
         if (ImGui::BeginMenu("File")) {
@@ -1744,7 +1821,8 @@ static void DrawUI() {
         }
         if (ImGui::BeginMenu("Help")) {
             ImGui::MenuItem("Space play/pause   Q cue   M mixer   1/2 focus", nullptr, false, false);
-            ImGui::MenuItem("left/right seek 5 s   - / = speed   L load   X xfade", nullptr, false, false);
+            ImGui::MenuItem("left/right seek 5 s   - / = speed   L load   X xfade   S switch A/B", nullptr, false, false);
+            ImGui::MenuItem("KEYLOCK keeps the pitch when the speed changes", nullptr, false, false);
             ImGui::MenuItem("drag waveform = seek, right-drag = scrub, wheel = zoom", nullptr, false, false);
             ImGui::MenuItem("playlist modes: SEQ / ALL / ONE / SHUF", nullptr, false, false);
             ImGui::EndMenu();
@@ -1825,15 +1903,8 @@ static void HandleShortcuts() {
         std::string p;
         if (PickFile(&p)) StartLoad(g_focus, p);
     }
-    if (ImGui::IsKeyPressed(ImGuiKey_X, false)) {
-        const int from = g_focus, to = 1 - from;
-        dj::Deck& dt = g_eng.deck[to];
-        if (dt.current.load()) {
-            dt.ArmFade(1.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), false);
-            dt.playing.store(true);
-            g_eng.deck[from].ArmFade(0.0f, (uint32_t)(g_fadeSecs * 1.5f * g_eng.sampleRate), true);
-        }
-    }
+    if (ImGui::IsKeyPressed(ImGuiKey_X, false)) AutoMix(g_focus, 1 - g_focus);
+    if (ImGui::IsKeyPressed(ImGuiKey_S, false)) SwitchDecks();
 }
 
 // ------------------------------------------------------------------ self test
@@ -2101,6 +2172,43 @@ static int RunSelfTest(bool allowNoDevice = false) {
               "%.0f vs %.0f frames", f2, f1);
         check(fabs(fh / f1 - 0.5) < 0.02, "0.50x consumes audio half as fast",
               "%.0f vs %.0f frames", fh, f1);
+    }
+
+    // ---- keylock: the rate must not drag the pitch along with it
+    {
+        auto pitchAt = [&](float rate) {
+            dj::Engine en;
+            en.InitOffline(48000);
+            en.masterGain.store(1.0f);
+            en.xfader.store(0.0f);
+            en.deck[0].pending.store(dj::MakeSineTrack(30.0, 440.0, 48000, 0.5f));
+            std::vector<float> b(1024 * 2);
+            en.RenderBlock(b.data(), 1024);            // adopt first
+            en.deck[0].rate.store(rate);
+            en.deck[0].keylock.store(true);
+            en.deck[0].ArmFade(1.0f, 0, false);
+            en.deck[0].playing.store(true);
+            for (int i = 0; i < 20; ++i) en.RenderBlock(b.data(), 1024);   // let the stretch settle
+            int   crossings = 0;
+            float prev = 0.0f;
+            bool  first = true;
+            for (int blk = 0; blk < 48; ++blk) {
+                en.RenderBlock(b.data(), 1024);
+                for (uint32_t s = 0; s < 1024; ++s) {
+                    const float v = b[s * 2];
+                    if (!first && ((prev < 0.0f) != (v < 0.0f))) ++crossings;
+                    prev = v;
+                    first = false;
+                }
+            }
+            if (dj::Track* r = en.deck[0].current.exchange(nullptr)) dj::FreeTrack(r);
+            while (dj::Track* r = en.deck[0].TakeRetired()) dj::FreeTrack(r);
+            return crossings * 0.5 * (48000.0 / (48.0 * 1024.0));
+        };
+        const double p1 = pitchAt(1.0f), p2 = pitchAt(2.0f), ph = pitchAt(0.5f);
+        check(fabs(p1 - 440.0) < 5.0,  "keylock: 440 Hz stays put at 1.00x", "%.0f Hz", p1);
+        check(fabs(p2 - 440.0) < 15.0, "keylock: 2.00x keeps the pitch (no chipmunk)", "%.0f Hz", p2);
+        check(fabs(ph - 440.0) < 15.0, "keylock: 0.50x keeps the pitch (no growl)", "%.0f Hz", ph);
     }
 
     // ---- real device ------------------------------------------------------

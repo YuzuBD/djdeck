@@ -266,6 +266,95 @@ bool GenerateDemoWav(const std::string& path, double seconds, double bpm, int st
     return true;
 }
 
+// ------------------------------------------------------------------ time-stretch
+// WSOLA: overlap-add windows on a fixed synthesis hop, each nudged by +/-D frames so
+// its phase matches the natural continuation of the previous window. Pitch comes from
+// the source untouched; only the *rate* at which we walk through it changes.
+void Stretch::Init() {
+    win.assign(N, 0.0f);
+    for (int i = 0; i < N; ++i)
+        win[i] = 0.25f - 0.25f * cosf(2.0f * kPi * (float)i / (float)N);  // 4x Hann sums to 1
+    acc[0].assign(N, 0.0f);
+    acc[1].assign(N, 0.0f);
+    Reset();
+}
+
+void Stretch::Reset() {
+    readPos  = Hs;                       // >= Hs makes the next pull refill from scratch
+    started  = false;
+    havePrev = false;
+    tPrev    = 0;
+    std::fill(acc[0].begin(), acc[0].end(), 0.0f);
+    std::fill(acc[1].begin(), acc[1].end(), 0.0f);
+}
+
+void Stretch::Next(const int16_t* pcm, uint64_t frames, double srcPos, float& l, float& r) {
+    if (readPos >= Hs) Refill(pcm, frames, srcPos);
+    l = acc[0][readPos];
+    r = acc[1][readPos];
+    ++readPos;
+}
+
+void Stretch::Refill(const int16_t* pcm, uint64_t frames, double srcPos) {
+    if (started) {
+        const int keep = N - Hs;         // exactly one hop was emitted since the last refill
+        std::memmove(acc[0].data(), acc[0].data() + Hs, sizeof(float) * keep);
+        std::memmove(acc[1].data(), acc[1].data() + Hs, sizeof(float) * keep);
+        std::fill(acc[0].begin() + keep, acc[0].end(), 0.0f);
+        std::fill(acc[1].begin() + keep, acc[1].end(), 0.0f);
+    } else {
+        std::fill(acc[0].begin(), acc[0].end(), 0.0f);
+        std::fill(acc[1].begin(), acc[1].end(), 0.0f);
+        started  = true;
+        havePrev = false;
+    }
+
+    const int maxTk   = (int)(frames - N);          // caller guarantees frames > N
+    const int nominal = (int)llround(srcPos);
+    int best = nominal < 0 ? 0 : (nominal > maxTk ? maxTk : nominal);
+
+    if (havePrev) {
+        // Reference: the source that would naturally have continued the previous window
+        // once one synthesis hop of output had passed.
+        int refP = (int)tPrev + Hs;
+        if (refP < 0) refP = 0;
+        if (refP + L > (int)frames) refP = (int)frames - L;
+        float  ref[L];
+        double refE = 1e-12;
+        for (int i = 0; i < L; ++i) {
+            const float m = (pcm[(refP + i) * 2] + pcm[(refP + i) * 2 + 1]) * (0.5f * kInvS16);
+            ref[i] = m;
+            refE  += double(m) * m;
+        }
+        double bestScore = -1e30;
+        for (int tau = -D; tau <= D; ++tau) {
+            int tk = nominal + tau;
+            if (tk < 0) tk = 0;
+            if (tk > maxTk) tk = maxTk;
+            double dot = 0.0, e = 1e-12;
+            for (int i = 0; i < L; ++i) {
+                const float m = (pcm[(tk + i) * 2] + pcm[(tk + i) * 2 + 1]) * (0.5f * kInvS16);
+                dot += double(m) * ref[i];
+                e   += double(m) * m;
+            }
+            const double score = dot / sqrt(refE * e);
+            if (score > bestScore) { bestScore = score; best = tk; }
+        }
+    }
+
+    float* aL = acc[0].data();
+    float* aR = acc[1].data();
+    for (int i = 0; i < N; ++i) {
+        const int f = (best + i) * 2;
+        const float w = win[i] * kInvS16;
+        aL[i] += w * (float)pcm[f];
+        aR[i] += w * (float)pcm[f + 1];
+    }
+    tPrev    = best;
+    havePrev = true;
+    readPos  = 0;
+}
+
 // ------------------------------------------------------------------ engine
 static void DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, ma_uint32 frameCount) {
     (void)pInput;
@@ -278,9 +367,11 @@ static void DataCallback(ma_device* pDevice, void* pOutput, const void* pInput, 
 
 void Engine::InitOffline(uint32_t rate) {
     sampleRate = rate;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 2; ++i) {
+        deck[i].stretch.Init();
         for (int c = 0; c < 2; ++c)
             mix[i][c].assign(kMaxBlock, 0.0f);
+    }
 }
 
 bool Engine::Start(std::string* err) {
@@ -392,6 +483,8 @@ void Deck::ResetTransport() {
     loopIn.store(UINT64_MAX, std::memory_order_relaxed);
     loopOut.store(UINT64_MAX, std::memory_order_relaxed);
     for (auto& b : bq) b.reset();
+    stretch.Reset();
+    stretchOn = false;
 }
 
 uint32_t Engine::renderChunk(float* out, uint32_t n) {
@@ -440,6 +533,14 @@ uint32_t Engine::renderChunk(float* out, uint32_t n) {
         const bool audible   = play || scrubbing;
         const double adv     = scrubbing ? (double)scr / (double)n : (double)rate;
 
+        // keylock: with the rate away from 1.0 and KEYLOCK on, the source is time-stretched
+        // so the pitch stays put; the direct resampler covers everything else (and scrubbing,
+        // which is meant to sound like a turntable).
+        const bool stretchable = d.keylock.load(std::memory_order_relaxed) && !scrubbing &&
+                                 d.stretch.Ready() && t->frames > (uint64_t)Stretch::N;
+        const bool useStretch  = stretchable && (rate < 0.999f || rate > 1.001f);
+        if (useStretch != d.stretchOn) { d.stretch.Reset(); d.stretchOn = useStretch; }
+
         // --- EQ coefficients --------------------------------------------------
         float eqv[3];
         for (int b = 0; b < 3; ++b) eqv[b] = d.eqDb[b].load(std::memory_order_relaxed);
@@ -470,6 +571,7 @@ uint32_t Engine::renderChunk(float* out, uint32_t n) {
                         d.atEnd.store(false, std::memory_order_relaxed);
                         d.dkStep      = 1.0f / (float)kDeclickFrames;
                         d.dkLeft      = kDeclickFrames;
+                        d.stretch.Reset();           // the read head moved: restage the stretcher
                     } else { d.dkLeft = 0; d.dkStep = 0.0f; }
                 } else if (d.dk >= 1.0f) {
                     d.dk = 1.0f; d.dkLeft = 0; d.dkStep = 0.0f;
@@ -486,16 +588,22 @@ uint32_t Engine::renderChunk(float* out, uint32_t n) {
 
             float sl = 0.0f, sr = 0.0f;
             if (audible) {
-                const uint64_t i0 = (uint64_t)d.frac;
-                if (i0 + 1 < t->frames) {
-                    const float mu = (float)(d.frac - (double)i0);
-                    const int16_t* p = pcm + i0 * 2;
-                    sl = (p[0] + (p[2] - p[0]) * mu) * kInvS16;
-                    sr = (p[1] + (p[3] - p[1]) * mu) * kInvS16;
+                if (useStretch) {
+                    d.stretch.Next(pcm, t->frames, d.frac, sl, sr);
+                } else {
+                    const uint64_t i0 = (uint64_t)d.frac;
+                    if (i0 + 1 < t->frames) {
+                        const float mu = (float)(d.frac - (double)i0);
+                        const int16_t* p = pcm + i0 * 2;
+                        sl = (p[0] + (p[2] - p[0]) * mu) * kInvS16;
+                        sr = (p[1] + (p[3] - p[1]) * mu) * kInvS16;
+                    }
                 }
                 d.frac += adv;
-                if (loopOn && loopOut != UINT64_MAX && loopOut > loopIn && d.frac >= (double)loopOut)
+                if (loopOn && loopOut != UINT64_MAX && loopOut > loopIn && d.frac >= (double)loopOut) {
                     d.frac = (double)loopIn + (d.frac - (double)loopOut);
+                    d.stretch.Reset();               // jumped back: restage the stretcher
+                }
                 if (d.frac >= lastFrame && !d.jumpPending && d.dkLeft == 0) {
                     d.frac = lastFrame;
                     d.playing.store(false, std::memory_order_relaxed);

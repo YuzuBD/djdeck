@@ -62,6 +62,35 @@ void MakeLowShelf(Biquad& q, float fs, float f0, float db);
 void MakePeak(Biquad& q, float fs, float f0, float q_, float db);
 void MakeHighShelf(Biquad& q, float fs, float f0, float db);
 
+// ---------------------------------------------------------------- time-stretch
+// Pitch-preserving time-stretch (WSOLA) for KEYLOCK. The source is chopped into
+// windows that are overlap-added on a fixed synthesis hop; every new window is
+// nudged within a small search range so it lines up in phase with the tail of the
+// previous one. At rate 1.0 the deck bypasses this and plays the samples directly.
+// Fully preallocated: the audio thread only reads and mixes, it never allocates.
+struct Stretch {
+    static constexpr int N = 1024;   // window length (frames)
+    static constexpr int Hs = 256;   // synthesis hop = N/4 -> four windows overlap
+    static constexpr int D  = 256;   // +/-(search) range for the phase nudge
+    static constexpr int L  = 384;   // correlation window length
+
+    std::vector<float> win;          // scaled Hann, length N (built once)
+    std::vector<float> acc[2];       // overlap-add accumulator, length N
+    int     readPos  = Hs;           // next sample to emit; >= Hs forces a refill
+    bool    started  = false;
+    bool    havePrev = false;
+    int64_t tPrev    = 0;            // source start of the last chosen window
+
+    void Init();                     // allocate + build the window (never the audio thread)
+    void Reset();                    // drop the accumulator; re-seed on the next pull
+    bool Ready() const { return (int)acc[0].size() == N; }
+    // Emit the next stereo frame, refilling from the source when the hop runs out.
+    void Next(const int16_t* pcm, uint64_t frames, double srcPos, float& l, float& r);
+
+  private:
+    void Refill(const int16_t* pcm, uint64_t frames, double srcPos);
+};
+
 // ---------------------------------------------------------------- deck
 // One deck. Everything the UI touches from another thread is atomic;
 // members below the "audio-thread private" line are touched only by renderBlock().
@@ -83,7 +112,8 @@ struct Deck {
     // UI -> audio
     std::atomic<uint64_t> seekReq{UINT64_MAX};   // absolute frame; consumed by audio
     std::atomic<int64_t>  scrubFrames{0};        // relative frames, consumed each block
-    std::atomic<float>    rate{1.0f};            // playback speed (pitch fader)
+    std::atomic<float>    rate{1.0f};            // playback speed
+    std::atomic<bool>     keylock{true};         // rate changes keep the pitch (time-stretch)
     std::atomic<float>    faderDb{0.0f};         // channel fader, dB
     std::atomic<float>    eqDb[3]{};             // low / mid / high, dB (<= -24 = kill)
     std::atomic<uint32_t> fadeSeq{0};            // bump to arm a fade
@@ -113,6 +143,8 @@ struct Deck {
     float    eqCache[3]  = {12345.f, 12345.f, 12345.f};
     Biquad   bq[3];
     bool     eqBypass    = true;
+    Stretch  stretch;                            // keylock time-stretch state
+    bool     stretchOn   = false;                // was the stretcher used last block
 
     // Arm a fade: target envelope (0..1) over `frames` frames.
     void ArmFade(float target, uint32_t frames, bool stopAfter) {
